@@ -6,6 +6,7 @@ Any message containing "delete" triggers a dangerous command (approval demo).
 Usage: mock_llm.py PORT
 """
 import json
+import os
 import sys
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -31,6 +32,12 @@ class H(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path.rstrip("/").endswith("/models"):
+            # MOCK_MODELS_JSON: serve a recorded catalogue (e.g. DeepInfra's, with metadata) instead.
+            custom = os.environ.get("MOCK_MODELS_JSON")
+            if custom:
+                with open(custom) as f:
+                    self._json(200, json.load(f))
+                return
             self._json(200, {"object": "list", "data": [{"id": m} for m in MODELS]})
         else:
             self._json(404, {"error": "not found"})
@@ -41,7 +48,11 @@ class H(BaseHTTPRequestHandler):
         msgs = req.get("messages", [])
         last = msgs[-1] if msgs else {}
         events = []
-        if last.get("role") == "user" and "Summarise" in str(last.get("content", "")):
+        content = last.get("content")
+        if last.get("role") == "user" and isinstance(content, list) and any(p.get("type") == "image_url" for p in content):
+            # Vision request: answer directly so the smoke test can see the image arrived.
+            events = [chunk({"content": "I can see %d image(s)." % sum(p.get("type") == "image_url" for p in content)}), chunk({}, "stop")]
+        elif last.get("role") == "user" and "Summarise" in str(last.get("content", "")):
             events = [chunk({"content": "- earlier discussion summarised"})]
         elif last.get("role") == "user":
             text = str(last.get("content", ""))

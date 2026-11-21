@@ -36,6 +36,8 @@ infrastructure that only makes sense on a long-running server.
 | `clarify`, `process_manage`, checkpoints + `/rollback`, `/insights` | **Yes (v0.2)** | Checkpoints are file snapshots, not Hermes's shadow git repo |
 | Profiles: pick up from an existing Hermes install | **Yes (v0.2)** | Copy or in-place; history imported read-only from `state.db` |
 | Profiles (`-p`, `profile list/use/create/delete`, separate chats/memory/skills per profile) | **Yes (v0.3)** | Providers shared across profiles |
+| Hermes Desktop: command palette, find, sidebar toggle, composer history, drafts, attachments, pin/archive, resume last chat, model favorites, reasoning-effort pill, context meter, tok/s, status-bar YOLO, skill toggles, profile export/import, provider test | **Yes (v0.4)** | |
+| Hermes Desktop: tabs/multi-window, preview rail, terminal rail, git review, worktrees, memory graph, voice, HUD, tray, themes import, i18n, cron UI, messaging, bot mode, remote gateways | **No** | See section 10 |
 | Messaging gateway (Telegram/Discord/Slack/…), cron, browser/CDP, computer use, image gen, TTS, execute_code sandbox, kanban, plugins, RL/trajectory tools | **No** | Server-side or very large surfaces |
 
 ## 2. Ease of install and navigation (the actual reason to build this)
@@ -193,3 +195,51 @@ separate per profile.
   `mercury label-provider ID LABEL`); the picker shows `label · local/LAN/cloud · host:port`.
 * Accessibility: every text field now has a screen-reader name (the GUI tests fail on unnamed widgets).
 * Tests: 136 automated (was 127) + AppImage smoke test 22/22 (was 17).
+
+## 10. v0.4 (2026-11-20)
+
+User feedback: more parity with the Hermes desktop app, stability, DeepInfra and any OpenAI-compatible
+API, and publish to github.com/AnonyMap/mercury.
+
+**Providers.** DeepInfra is OpenAI-compatible at `https://api.deepinfra.com/v1/openai`, with quirks
+Mercury now handles: its `/models` lists every surface (image generation, TTS, embeddings) with
+`metadata.tags`, so non-chat models are filtered out by tag (and the same logic covers LM Studio's
+`type` and OpenRouter's `context_length`); reported context lengths feed compression and the context
+meter; `reasoning_effort` is a per-provider setting with a top-bar picker; extra request fields carry
+non-standard options (`service_tier`, `top_k`…); extra headers cover gateways and OpenRouter's app
+headers; most DeepInfra models cap output at 16k tokens, so `finish_reason: length` produces a notice and
+`/continue` exists; DeepInfra answers 429 `engine_overloaded` under load, which is retried. Ten hosted
+presets in all; `add-provider <preset>` needs no URL. Test connection lists models, sends a one-word
+request and explains failures (missing key, missing `/v1`, DeepInfra's root URL, nothing listening).
+
+**Stability.** Transient failures before the first token (connect errors, 408/409/425/429/5xx/52x,
+stalls) are retried with exponential back-off honouring `Retry-After`; never after output has been
+shown, since that would duplicate it. A stream that drops or goes quiet midway returns
+`Interrupted { partial }`: the partial reply is committed and the user can `/continue`. First-token
+timeout 10 min (local servers loading a model), idle timeout 3 min (configurable). The GUI runs agent
+work under `catch_unwind`, so a panic produces an error card instead of a permanently busy window; a
+panic hook writes reports to `logs/`, and a crash report found at start-up is announced once.
+Unparseable settings files are renamed `*.broken-<time>` and defaults used. Config writes fsync before
+rename. Terminal output into a closed pipe (`mercury sessions | head`) exits quietly instead of
+panicking; the smoke test caught that one.
+
+**Desktop parity.** Picked from the Hermes Desktop docs for what a single-window egui app can do well:
+command palette (Ctrl+K/P) over chats, commands, models, profiles, settings and provider tests; find in
+chat (Ctrl+F) with match highlighting and scroll-to; Ctrl+B sidebar; ↑/↓ composer history; per-chat
+drafts; attachments by drag-and-drop or `+` (images downscaled to 1568 px and sent as `image_url` parts,
+text/code inlined, binaries and PDFs refused with a reason); copy buttons; pinned and archived chats;
+reopen the last chat; starred models; context meter, tok/s and a YOLO switch in the status bar; skill
+on/off switches; profile export/import (`.tar.gz`, API keys, secret-looking headers and MCP env values
+stripped; import refuses links, `..`, absolute paths and oversize archives).
+
+Not done, by size: tabs and pop-out windows, preview/terminal rails, git review and worktrees, memory
+graph, voice, HUD/tray, theme import, translations, cron UI, messaging gateway, bot mode, remote
+gateways, Responses/Anthropic API modes.
+
+**Repository.** Pushed to github.com/AnonyMap/mercury with CI (fmt, clippy `-D warnings`, all tests) and
+a tag-triggered release workflow that builds the AppImage with the glibc 2.31 floor, runs the smoke test
+and attaches the AppImage to the release.
+
+Tests: 165 automated (was 136) + AppImage smoke test 32/32 (was 22): presets, `configure-provider`,
+`test-provider`, image and text attachments through the packaged binary, profile export (checked for
+leaked keys) and import, and a GUI round trip that starts with Ctrl+N because the last chat now reopens.

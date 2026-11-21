@@ -4,7 +4,8 @@
 #   2. the binary's glibc requirement
 #   3. terminal mode: add a provider, doctor, one-shot chat with a real tool call (mock model)
 #   4. Hermes import, profiles with separate chats, MCP
-#   5. GUI mode under Xvfb: window appears, a message round-trips, clipboard paste works, screenshot saved
+#   5. presets (DeepInfra), provider options, connection test, attachments, profile export/import
+#   6. GUI mode under Xvfb: window appears, a message round-trips, clipboard paste works, screenshot saved
 # Usage: packaging/smoke.sh path/to/Mercury.AppImage [screenshot-dir]
 set -euo pipefail
 APP="$(readlink -f "$1")"
@@ -71,6 +72,24 @@ PY
 "$APP" profile use default >/dev/null
 "$APP" use mock-box hermes-4-14b >/dev/null
 
+# v0.4: hosted presets, request options, connection test, attachments, profile export/import.
+"$APP" presets | grep -q "api.deepinfra.com/v1/openai" && pass "DeepInfra preset listed" || fail "presets"
+"$APP" add-provider deepinfra --key sk-smoke >/dev/null && "$APP" providers | grep -q "deepinfra.*api.deepinfra.com/v1/openai" && pass "add-provider deepinfra needs no URL" || fail "add deepinfra"
+"$APP" configure-provider deepinfra --effort low --extra-json '{"service_tier":"flex"}' >/dev/null
+grep -q 'reasoning_effort = "low"' "$MERCURY_HOME/config.toml" && grep -q 'service_tier = "flex"' "$MERCURY_HOME/config.toml" && pass "provider options saved" || fail "configure-provider"
+"$APP" test-provider mock-box | tee "$SHOTS/probe.txt" | grep -q "^OK: 3 chat models listed" && pass "test-provider" || fail "probe: $(cat "$SHOTS/probe.txt")"
+printf 'quokka inventory: 12 boxes\n' > "$WORK/notes.txt"
+cp "$HERE/mercury.png" "$WORK/dot.png"
+out="$(cd "$WORK" && "$APP" chat -q "What is this?" --attach dot.png 2>&1)"
+grep -q "I can see 1 image" <<<"$out" && pass "image attachment reaches the model" || fail "image attach: $out"
+(cd "$WORK" && "$APP" chat -q "Check my notes" --attach notes.txt >/dev/null 2>&1)
+"$APP" sessions --search quokka | grep -q "Check my notes" && pass "text attachment inlined and searchable" || fail "text attach"
+EXP="$(mktemp -d)"
+"$APP" profile export default -o "$EXP/default.tar.gz" | grep -q "no API keys" && pass "profile exported" || fail "export"
+! (tar -xzOf "$EXP/default.tar.gz" | grep -q "sk-smoke") && pass "export has no API keys" || fail "key leaked into export"
+"$APP" profile import "$EXP/default.tar.gz" --as restored | grep -q "Imported as profile “restored”" && pass "profile imported" || fail "import"
+"$APP" -p restored sessions --search quokka | grep -q "Check my notes" && pass "imported profile has the chats" || fail "imported chats"
+
 if command -v Xvfb >/dev/null && python3 -c "import Xlib" 2>/dev/null; then
     DISP=":$((90 + RANDOM % 9))"
     Xvfb "$DISP" -screen 0 1280x860x24 >/dev/null 2>&1 & XVFB=$!
@@ -78,7 +97,8 @@ if command -v Xvfb >/dev/null && python3 -c "import Xlib" 2>/dev/null; then
     (cd "$WORK" && DISPLAY="$DISP" "$APP" >"$SHOTS/gui.log" 2>&1) & GUI=$!
     sleep 5
     kill -0 $GUI 2>/dev/null && pass "GUI started" || fail "GUI exited: $(cat "$SHOTS/gui.log")"
-    DISPLAY="$DISP" python3 "$HERE/xdrive.py" focus Mercury click 650 700 sleep 0.4 type "What is in this project?" key Return sleep 4
+    # Mercury reopens the last chat; Ctrl+N starts a fresh one for the round trip.
+    DISPLAY="$DISP" python3 "$HERE/xdrive.py" focus Mercury ctrl n sleep 0.6 click 650 700 sleep 0.4 type "What is in this project?" key Return sleep 4
     DISPLAY="$DISP" import -window root -crop 1180x780+0+0 "$SHOTS/gui.png"
     sessions="$("$APP" sessions | grep -c "What is in this project" || true)"
     [[ "$sessions" -ge 2 ]] && pass "GUI round trip saved a second session" || fail "GUI chat did not complete"

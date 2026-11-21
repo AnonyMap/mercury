@@ -820,3 +820,24 @@ fn yolo_toggle_in_the_status_bar() {
     h.run_steps(3);
     assert_eq!(h.state().config.approvals, ApprovalMode::Ask);
 }
+
+#[test]
+fn context_meter_uses_the_window_the_server_reports() {
+    let rt = rt();
+    let mock = rt.block_on(start());
+    *mock.state.models_json.lock().unwrap() = Some(
+        json!({"data": [{"id": "test-model", "metadata": {"tags": ["chat", "vision"], "context_length": 65536, "description": "", "pricing": {}}}]}),
+    );
+    mock.push_chat(text("hi"));
+    let (_d, mut app) = app_with_mock(&rt, &mock.base());
+    app.input = "hello".into();
+    let mut h = harness(app);
+    wait(&mut h, "model list", |a| a.model_meta.contains_key("mock/test-model"));
+    h.get_by_label("Send").click();
+    wait(&mut h, "reply", |a| !a.busy && a.items.len() >= 2);
+    h.get_by_label_contains("context 15 / 65k");
+    // The model menu shows what the server said about the model.
+    h.get_by_label("Model").click_accesskit();
+    h.run_steps(3);
+    h.get_by_label_contains("test-model  · 65k  · vision");
+}

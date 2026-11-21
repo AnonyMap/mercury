@@ -320,7 +320,7 @@ impl MercuryApp {
         };
         app.logs_dir = app.paths.data_dir.join("logs");
         if let Some(report) = crate::crashlog::take_previous_crash(&app.logs_dir) {
-            app.toast(format!("Mercury closed unexpectedly last time. The report is in {}", report.display()));
+            app.toast(format!("Mercury hit an internal error last time (it may have closed). The report is in {}", report.display()));
         }
         app.history = app.store.recent_user_messages(100).unwrap_or_default();
         app.profiles = crate::profiles::list(&app.paths);
@@ -432,8 +432,20 @@ impl MercuryApp {
             }
             UiMsg::Models { provider, result } => match result {
                 Ok(list) => {
+                    let mut windows = vec![];
                     for m in &list {
-                        self.model_meta.insert(format!("{provider}/{}", m.id), m.clone());
+                        let key = format!("{provider}/{}", m.id);
+                        if let Some(n) = m.context_length {
+                            windows.push((key.clone(), n));
+                        }
+                        self.model_meta.insert(key, m.clone());
+                    }
+                    if !windows.is_empty() {
+                        // The agent plans compression (and the context meter) with these.
+                        let agent = self.agent.clone();
+                        self.spawn(async move {
+                            agent.lock().await.model_context.extend(windows);
+                        });
                     }
                     self.models.insert(provider, list.into_iter().map(|m| m.id).collect());
                 }
@@ -1567,7 +1579,7 @@ impl MercuryApp {
 
     fn top_bar(&mut self, ui: &mut Ui) {
         // At large text sizes the pickers move to a second row instead of overlapping the controls.
-        let compact = ui.available_width() < 1130.0;
+        let compact = ui.available_width() < 1320.0;
         ui.horizontal(|ui| {
             let hint = if self.config.ui.show_sidebar { "Hide the chats sidebar (Ctrl+B)" } else { "Show the chats sidebar (Ctrl+B)" };
             if ui.small_button("☰").on_hover_text(hint).clicked() {
@@ -1730,7 +1742,8 @@ impl MercuryApp {
     fn status_bar(&mut self, ui: &mut Ui) {
         let p = theme::palette(self.config.ui.dark);
         ui.horizontal(|ui| {
-            ui.label(RichText::new(format!("📁 {}", self.workdir.display())).small().color(p.muted));
+            ui.label(RichText::new(format!("📁 {}", short_path(&self.workdir, 48))).small().color(p.muted))
+                .on_hover_text(self.workdir.display().to_string());
             ui.separator();
             if let Some(prov) = self.config.active() {
                 let (label, color) = match (prov.kind, prov.is_local()) {
@@ -2040,7 +2053,7 @@ impl MercuryApp {
                 });
                 return;
             }
-            egui::ScrollArea::vertical().id_salt("chat_scroll").stick_to_bottom(true).auto_shrink(false).show(ui, |ui| {
+            egui::ScrollArea::vertical().id_salt("chat_scroll").stick_to_bottom(self.find.is_none()).auto_shrink(false).show(ui, |ui| {
                 ui.set_max_width(ui.available_width().min(980.0));
                 let matches = self.find.as_ref().map(|f| chat::find_matches(&self.items, &f.query)).unwrap_or_default();
                 let hl = match &mut self.find {
@@ -2323,6 +2336,24 @@ impl eframe::App for MercuryApp {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         self.ui_root(ui);
     }
+}
+
+/// A path for a status line: `~` for home, the middle elided past `max` characters.
+pub fn short_path(p: &std::path::Path, max: usize) -> String {
+    let mut s = p.display().to_string();
+    if let Some(home) = dirs::home_dir().map(|h| h.display().to_string()).filter(|h| h.len() > 1)
+        && s.starts_with(&home)
+    {
+        s = format!("~{}", &s[home.len()..]);
+    }
+    let n = s.chars().count();
+    if n <= max {
+        return s;
+    }
+    let keep = max.saturating_sub(1) / 2;
+    let head: String = s.chars().take(keep).collect();
+    let tail: String = s.chars().skip(n - keep).collect();
+    format!("{head}…{tail}")
 }
 
 /// 1234 → "1.2k", 128000 → "128k".

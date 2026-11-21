@@ -1,0 +1,42 @@
+name: Release AppImage
+
+# Push a tag like v0.4.0 to build the AppImage and attach it to a GitHub release.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  appimage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install zig, cargo-zigbuild and appimagetool
+        run: |
+          pip install ziglang
+          cargo install cargo-zigbuild --locked
+          sudo apt-get update && sudo apt-get install -y libfuse2 xvfb python3-xlib imagemagick binutils
+          curl -fsSL -o appimagetool https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x appimagetool
+          echo "APPIMAGETOOL=$PWD/appimagetool" >> "$GITHUB_ENV"
+      - name: Build (glibc 2.31 floor)
+        run: packaging/build-appimage.sh
+      - name: Smoke test the AppImage
+        run: packaging/smoke.sh dist/Mercury-*-x86_64.AppImage smoke-artifacts
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mercury-appimage
+          path: |
+            dist/*.AppImage
+            smoke-artifacts/*.png
+      - name: Attach to the release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.AppImage
+          generate_release_notes: true

@@ -85,6 +85,18 @@ if __name__ == "__main__":
         elif a == "focus":
             focus(args[i + 1])
             i += 2
+        elif a == "scroll":
+            # scroll X Y N: mouse wheel at (X, Y); N > 0 scrolls down, N < 0 up.
+            x, y, n = int(args[i + 1]), int(args[i + 2]), int(args[i + 3])
+            d.screen().root.warp_pointer(x, y)
+            d.sync()
+            button = 5 if n > 0 else 4
+            for _ in range(abs(n)):
+                xtest.fake_input(d, X.ButtonPress, button)
+                xtest.fake_input(d, X.ButtonRelease, button)
+                d.sync()
+                time.sleep(0.03)
+            i += 4
         elif a == "sleep":
             time.sleep(float(args[i + 1]))
             i += 2

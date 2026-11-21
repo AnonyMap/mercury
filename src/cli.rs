@@ -1,5 +1,30 @@
 //! Terminal front end: subcommands and an interactive REPL for SSH / headless use.
 
+// Output piped into `head`, `grep -q` or a closed terminal: stop quietly, like other Unix tools,
+// instead of std's `println!` panicking on a broken pipe. (SIGPIPE stays ignored: MCP servers and
+// sockets must not be able to kill the process.)
+macro_rules! println {
+    ($($t:tt)*) => {{
+        use std::io::Write as _;
+        $crate::cli::exit_on_broken_pipe(writeln!(std::io::stdout(), $($t)*));
+    }};
+}
+macro_rules! print {
+    ($($t:tt)*) => {{
+        use std::io::Write as _;
+        $crate::cli::exit_on_broken_pipe(write!(std::io::stdout(), $($t)*));
+    }};
+}
+
+#[doc(hidden)]
+pub fn exit_on_broken_pipe(r: std::io::Result<()>) {
+    if let Err(e) = r
+        && e.kind() == std::io::ErrorKind::BrokenPipe
+    {
+        std::process::exit(0);
+    }
+}
+
 use std::io::{BufRead, IsTerminal, Write};
 use std::time::Duration;
 
@@ -749,6 +774,11 @@ async fn chat(
         } else {
             agent.config.active_model = Some(m.clone());
         }
+    }
+    // Learn the model's context window from the server (DeepInfra, OpenRouter, LM Studio report it),
+    // so compression doesn't kick in at the 32k default on a 160k model. Best effort, bounded.
+    if agent.config.active().is_some_and(|p| p.context_window == 0) {
+        let _ = tokio::time::timeout(Duration::from_secs(5), agent.list_model_info()).await;
     }
     let color = std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
     if let Some(q) = query {
