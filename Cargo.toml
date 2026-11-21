@@ -1,0 +1,51 @@
+[package]
+name = "mercury"
+version = "0.3.0"
+edition = "2024"
+rust-version = "1.95"
+description = "Mercury: a fast, single-file desktop client for the Hermes agent workflow (Nous Portal + OpenAI-compatible local models)"
+license = "MIT"
+
+[features]
+default = ["gui"]
+gui = ["dep:eframe", "dep:egui", "dep:egui_commonmark", "dep:rfd"]
+
+[dependencies]
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+toml = "0.9"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "time", "sync", "fs", "io-util", "net", "signal"] }
+tokio-util = "0.7"
+futures-util = "0.3"
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "form", "query", "rustls", "http2"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
+clap = { version = "4", features = ["derive"] }
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4"] }
+dirs = "6"
+regex = "1"
+ignore = "0.4"
+html2text = "0.17"
+base64 = "0.22"
+url = "2"
+open = "5"
+rfd = { version = "0.18", default-features = false, features = ["xdg-portal"], optional = true }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif", "bmp", "ico"] }
+tempfile = "3"
+eframe = { version = "0.37", optional = true, default-features = false, features = ["glow", "wayland", "x11", "default_fonts", "accesskit", "clipboard", "links"] }
+egui = { version = "0.37", optional = true, features = ["monochrome_emoji_fonts"] }
+egui_commonmark = { version = "0.26", optional = true }
+
+[dev-dependencies]
+axum = "0.8"
+
+egui_kittest = "0.37"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 4
+strip = true

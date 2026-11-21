@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Mercury
+GenericName=AI Agent
+Comment=Agent client for Nous Portal and local OpenAI-compatible models
+Exec=mercury
+Icon=mercury
+Terminal=false
+Categories=Utility;Development;
+Keywords=AI;LLM;Hermes;Nous;Ollama;agent;chat;
+StartupWMClass=mercury
