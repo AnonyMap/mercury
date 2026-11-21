@@ -2,10 +2,12 @@
 
 pub mod agent;
 pub mod approval;
+pub mod attach;
 pub mod checkpoints;
 pub mod cli;
 pub mod commands;
 pub mod config;
+pub mod crashlog;
 pub mod discovery;
 #[cfg(feature = "gui")]
 pub mod gui;
@@ -14,6 +16,8 @@ pub mod logo;
 pub mod mcp;
 pub mod memory;
 pub mod nous;
+pub mod portable;
+pub mod probe;
 pub mod profiles;
 pub mod provider;
 pub mod session;

@@ -66,6 +66,8 @@ pub struct SkillLibrary {
     pub home: PathBuf,
     /// Read-only extras (e.g. `~/.hermes/skills`).
     pub extra: Vec<PathBuf>,
+    /// Names switched off in settings: hidden from `list`, `index` and the skill tools.
+    pub disabled: Vec<String>,
 }
 
 fn collect(root: &Path, writable: bool, depth: usize, out: &mut Vec<Skill>) {
@@ -99,10 +101,27 @@ pub fn valid_name(name: &str) -> bool {
 
 impl SkillLibrary {
     pub fn new(home: PathBuf, extra: Vec<PathBuf>) -> Self {
-        Self { home, extra }
+        Self { home, extra, disabled: vec![] }
     }
 
+    pub fn disabling(mut self, names: Vec<String>) -> Self {
+        self.disabled = names;
+        self
+    }
+
+    pub fn is_enabled(&self, name: &str) -> bool {
+        !self.disabled.iter().any(|d| d == name)
+    }
+
+    /// Enabled skills.
     pub fn list(&self) -> Vec<Skill> {
+        let mut v = self.list_all();
+        v.retain(|s| self.is_enabled(&s.name));
+        v
+    }
+
+    /// Every skill, enabled or not (for settings).
+    pub fn list_all(&self) -> Vec<Skill> {
         let mut out = Vec::new();
         collect(&self.home, true, 0, &mut out);
         for e in &self.extra {

@@ -1,6 +1,6 @@
 [package]
 name = "mercury"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.95"
 description = "Mercury: a fast, single-file desktop client for the Hermes agent workflow (Nous Portal + OpenAI-compatible local models)"
@@ -30,6 +30,8 @@ regex = "1"
 ignore = "0.4"
 html2text = "0.17"
 base64 = "0.22"
+tar = "0.4"
+flate2 = "1"
 url = "2"
 open = "5"
 rfd = { version = "0.18", default-features = false, features = ["xdg-portal"], optional = true }

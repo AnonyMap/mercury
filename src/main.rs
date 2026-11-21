@@ -5,6 +5,7 @@ use mercury::config::{Config, Paths};
 fn main() {
     let cli = Cli::parse();
     let root = Paths::resolve();
+    mercury::crashlog::install(root.data_dir.join("logs"));
     let paths = root.with_profile(&mercury::profiles::resolve(&root, cli.profile.as_deref()));
     let wants_gui = match &cli.command {
         Some(Cmd::Gui) => true,
@@ -21,8 +22,8 @@ fn main() {
 #[cfg(feature = "gui")]
 fn gui(paths: Paths) -> anyhow::Result<()> {
     paths.ensure()?;
-    let config = Config::load_profile(&paths)?;
-    mercury::gui::run(paths, config)
+    let (config, warnings) = Config::load_profile_recovering(&paths)?;
+    mercury::gui::run(paths, config, warnings)
 }
 
 #[cfg(not(feature = "gui"))]

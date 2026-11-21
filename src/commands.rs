@@ -4,6 +4,8 @@
 pub enum Command {
     New,
     Retry,
+    /// Ask the model to pick up a reply that hit the output limit or was cut off.
+    Continue,
     Undo,
     Compress,
     Usage,
@@ -40,6 +42,7 @@ pub const HELP: &[(&str, &str)] = &[
     ("/model [provider:]name", "show or switch the model"),
     ("/provider [id]", "show or switch the provider"),
     ("/retry", "drop the last answer and ask again"),
+    ("/continue", "carry on a reply that was cut off"),
     ("/undo", "remove the last exchange"),
     ("/compress", "summarise older turns to free context"),
     ("/usage", "token usage for this session"),
@@ -88,6 +91,7 @@ pub fn parse(input: &str, skill_names: &[String]) -> Option<Command> {
     Some(match lc.as_str() {
         "new" | "reset" | "clear" => Command::New,
         "retry" => Command::Retry,
+        "continue" | "cont" | "more" => Command::Continue,
         "undo" => Command::Undo,
         "compress" => Command::Compress,
         "usage" | "cost" => Command::Usage,

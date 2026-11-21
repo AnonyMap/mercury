@@ -105,14 +105,26 @@ pub struct ProviderConfig {
     /// Send tool definitions. Turn off for local models that can't do function calling.
     #[serde(default = "yes")]
     pub tools: bool,
-    /// Context window hint used for auto-compression; 0 = use the global default.
+    /// Context window hint used for auto-compression; 0 = what the server reports, else the global default.
     #[serde(default)]
     pub context_window: u32,
+    /// `reasoning_effort` sent with every request: none / low / medium / high. Unset = server default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    /// Extra HTTP headers, e.g. `HTTP-Referer` for OpenRouter or a gateway's own key header.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub headers: BTreeMap<String, String>,
+    /// Extra JSON fields merged into each chat request, e.g. DeepInfra's `service_tier = "flex"`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra_body: BTreeMap<String, serde_json::Value>,
 }
 
 fn yes() -> bool {
     true
 }
+
+/// Values accepted for `reasoning_effort` (DeepInfra, OpenAI, OpenRouter, vLLM, llama.cpp).
+pub const REASONING_EFFORTS: &[&str] = &["none", "low", "medium", "high"];
 
 impl ProviderConfig {
     pub fn openai(id: &str, name: &str, base_url: &str) -> Self {
@@ -126,6 +138,9 @@ impl ProviderConfig {
             default_model: String::new(),
             tools: true,
             context_window: 0,
+            reasoning_effort: None,
+            headers: BTreeMap::new(),
+            extra_body: BTreeMap::new(),
         }
     }
 
@@ -140,11 +155,61 @@ impl ProviderConfig {
             default_model: String::new(),
             tools: true,
             context_window: 0,
+            reasoning_effort: None,
+            headers: BTreeMap::new(),
+            extra_body: BTreeMap::new(),
         }
     }
 
     pub fn is_local(&self) -> bool {
         is_local_url(&self.base_url)
+    }
+
+    /// Request options for this provider's client.
+    pub fn client_options(&self, agent: &AgentConfig) -> crate::provider::ClientOptions {
+        crate::provider::ClientOptions {
+            headers: self.headers.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+            extra_body: self.extra_body.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+            reasoning_effort: self.reasoning_effort.clone().filter(|e| !e.is_empty()),
+            retries: agent.retries,
+            retry_base: std::time::Duration::from_millis(agent.retry_base_ms.max(1)),
+            idle_timeout: std::time::Duration::from_secs(agent.stall_timeout_secs.max(10) as u64),
+            ..Default::default()
+        }
+    }
+
+    /// Parse the "Extra request fields" box: a JSON object, or empty.
+    pub fn parse_extra_body(text: &str) -> std::result::Result<BTreeMap<String, serde_json::Value>, String> {
+        if text.trim().is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        match serde_json::from_str::<serde_json::Value>(text) {
+            Ok(serde_json::Value::Object(m)) => {
+                if let Some(k) = m.iter().find(|(_, v)| v.is_null()).map(|(k, _)| k) {
+                    return Err(format!("\"{k}\" is null; leave it out instead"));
+                }
+                Ok(m.into_iter().collect())
+            }
+            Ok(_) => Err("must be a JSON object, e.g. {\"service_tier\": \"flex\"}".into()),
+            Err(e) => Err(format!("not valid JSON: {e}")),
+        }
+    }
+
+    /// Parse the headers box: one `Name: value` per line.
+    pub fn parse_headers(text: &str) -> std::result::Result<BTreeMap<String, String>, String> {
+        let mut out = BTreeMap::new();
+        for line in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
+            let (k, v) = line.split_once(':').ok_or_else(|| format!("\"{line}\" should look like Name: value"))?;
+            let k = k.trim();
+            if k.is_empty() || !k.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+                return Err(format!("\"{k}\" isn't a valid header name"));
+            }
+            if k.eq_ignore_ascii_case("authorization") {
+                return Err("put the key in the API key field, not a header".into());
+            }
+            out.insert(k.to_string(), v.trim().to_string());
+        }
+        Ok(out)
     }
 
     /// The key to send, resolving `api_key_env` at call time.
@@ -246,6 +311,12 @@ pub struct AgentConfig {
     pub default_context_window: u32,
     pub personality: String,
     pub workdir: Option<PathBuf>,
+    /// Retries for busy / rate-limited / unreachable servers before the reply starts.
+    pub retries: u32,
+    /// A reply that goes quiet this long (after it started) is treated as broken.
+    pub stall_timeout_secs: u32,
+    /// First retry delay in milliseconds (doubles each time).
+    pub retry_base_ms: u64,
 }
 
 impl Default for AgentConfig {
@@ -257,6 +328,9 @@ impl Default for AgentConfig {
             default_context_window: 32_768,
             personality: "default".into(),
             workdir: None,
+            retries: 3,
+            stall_timeout_secs: 180,
+            retry_base_ms: 1000,
         }
     }
 }
@@ -298,6 +372,8 @@ pub struct Config {
     pub extra_skill_dirs: Vec<PathBuf>,
     /// Override the writable skills folder (a Hermes profile's `skills/` when used in place).
     pub skills_dir: Option<PathBuf>,
+    /// Skills switched off: not offered to the model, not runnable as `/<name>` (per profile).
+    pub disabled_skills: Vec<String>,
     /// Override the persona file (a Hermes profile's `SOUL.md` when used in place).
     pub soul_file: Option<PathBuf>,
     /// MCP servers, same shape as Hermes's `mcp_servers:` block.
@@ -321,6 +397,7 @@ pub struct ProfileSettings {
     pub skills_dir: Option<PathBuf>,
     pub soul_file: Option<PathBuf>,
     pub extra_skill_dirs: Vec<PathBuf>,
+    pub disabled_skills: Vec<String>,
     pub mcp_servers: BTreeMap<String, McpServerConfig>,
     pub custom_personalities: BTreeMap<String, String>,
     pub hermes: Option<HermesLink>,
@@ -382,12 +459,46 @@ pub struct UiConfig {
     pub logo: Logo,
     /// Mercury's own copy of the custom logo image (PNG).
     pub custom_logo: Option<PathBuf>,
+    /// Chats sidebar visible (Ctrl+B).
+    pub show_sidebar: bool,
+    /// Open the last chat on start instead of a blank one.
+    pub resume_last: bool,
+    /// Starred models, as `provider/model`; listed first in the model menu.
+    pub favorite_models: Vec<String>,
+    /// Status bar: speed of the last reply.
+    pub show_speed: bool,
 }
 
 impl Default for UiConfig {
     fn default() -> Self {
-        Self { dark: true, show_reasoning: false, font_scale: 0.0, logo: Logo::Orb, custom_logo: None }
+        Self {
+            dark: true,
+            show_reasoning: false,
+            font_scale: 0.0,
+            logo: Logo::Orb,
+            custom_logo: None,
+            show_sidebar: true,
+            resume_last: true,
+            favorite_models: vec![],
+            show_speed: true,
+        }
     }
+}
+
+/// Write a file so that a crash or power cut leaves either the old or the new contents.
+pub fn write_atomic(path: &Path, text: &str) -> Result<()> {
+    use std::io::Write;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
+    {
+        let mut f = std::fs::File::create(&tmp).with_context(|| format!("writing {}", tmp.display()))?;
+        f.write_all(text.as_bytes())?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, path).with_context(|| format!("replacing {}", path.display()))?;
+    Ok(())
 }
 
 pub const MIN_SCALE: f32 = 0.75;
@@ -420,11 +531,38 @@ impl Config {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let text = toml::to_string_pretty(self)?;
-        let tmp = path.with_extension("toml.tmp");
-        std::fs::write(&tmp, text)?;
-        std::fs::rename(&tmp, path)?;
-        Ok(())
+        write_atomic(path, &toml::to_string_pretty(self)?)
+    }
+
+    /// Like [`Config::load_profile`], but a settings file that no longer parses (hand-edited, or
+    /// cut short by a crash on an old version) is moved aside instead of keeping Mercury from
+    /// starting. Returns the warnings to show.
+    pub fn load_profile_recovering(paths: &Paths) -> Result<(Self, Vec<String>)> {
+        let mut warnings = vec![];
+        for _ in 0..2 {
+            match Self::load_profile(paths) {
+                Ok(c) => return Ok((c, warnings)),
+                Err(e) => {
+                    let bad = [paths.config_file(), paths.profile_file()]
+                        .into_iter()
+                        .find(|f| std::fs::read_to_string(f).is_ok_and(|t| toml::from_str::<toml::Table>(&t).is_err()));
+                    let Some(bad) = bad else { return Err(e) };
+                    let aside = bad.with_extension(format!("toml.broken-{}", chrono::Local::now().format("%Y%m%d-%H%M%S")));
+                    std::fs::rename(&bad, &aside)?;
+                    warnings.push(format!(
+                        "{} couldn't be read ({e:#}). It was moved to {} and defaults are in use.",
+                        bad.display(),
+                        aside.display()
+                    ));
+                }
+            }
+        }
+        Ok((Self::load_profile(paths)?, warnings))
+    }
+
+    /// The skills this profile can see, with its disabled ones switched off.
+    pub fn skill_library(&self, paths: &Paths) -> crate::skills::SkillLibrary {
+        crate::skills::SkillLibrary::new(self.skills_dir(paths), self.extra_skill_dirs.clone()).disabling(self.disabled_skills.clone())
     }
 
     /// Shared settings from `config.toml` merged with `paths.profile`'s own `profile.toml`.
@@ -467,10 +605,9 @@ impl Config {
         if let Some(parent) = file.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let tmp = file.with_extension("toml.tmp");
-        std::fs::write(&tmp, toml::to_string_pretty(&self.profile_settings())?)?;
-        std::fs::rename(&tmp, &file)?;
+        write_atomic(&file, &toml::to_string_pretty(&self.profile_settings())?)?;
         let mut shared = self.clone();
+        shared.disabled_skills.clear();
         shared.memories_dir = None;
         shared.skills_dir = None;
         shared.soul_file = None;
@@ -490,6 +627,7 @@ impl Config {
             skills_dir: self.skills_dir.clone(),
             soul_file: self.soul_file.clone(),
             extra_skill_dirs: self.extra_skill_dirs.clone(),
+            disabled_skills: self.disabled_skills.clone(),
             mcp_servers: self.mcp_servers.clone(),
             custom_personalities: self.custom_personalities.clone(),
             hermes: self.hermes.clone(),
@@ -506,6 +644,7 @@ impl Config {
         self.skills_dir = p.skills_dir;
         self.soul_file = p.soul_file;
         self.extra_skill_dirs = p.extra_skill_dirs;
+        self.disabled_skills = p.disabled_skills;
         self.mcp_servers = p.mcp_servers;
         self.custom_personalities = p.custom_personalities;
         self.hermes = p.hermes;
@@ -579,12 +718,31 @@ pub fn presets() -> Vec<ProviderConfig> {
     v.push(nous_key);
     let mut openrouter = ProviderConfig::openai("openrouter", "OpenRouter", "https://openrouter.ai/api/v1");
     openrouter.api_key_env = Some("OPENROUTER_API_KEY".into());
+    // OpenRouter asks apps to identify themselves; harmless elsewhere.
+    openrouter.headers.insert("X-Title".into(), "Mercury".into());
     v.push(openrouter);
-    let mut openai = ProviderConfig::openai("openai", "OpenAI", "https://api.openai.com/v1");
-    openai.api_key_env = Some("OPENAI_API_KEY".into());
-    v.push(openai);
+    for (id, name, url, env) in CLOUD_PRESETS {
+        let mut p = ProviderConfig::openai(id, name, url);
+        p.api_key_env = Some((*env).into());
+        v.push(p);
+    }
     v
 }
+
+/// Hosted OpenAI-compatible services: (id, name, base URL, key variable). Anything else that speaks
+/// `/v1/chat/completions` works through "Custom endpoint".
+pub const CLOUD_PRESETS: &[(&str, &str, &str, &str)] = &[
+    ("deepinfra", "DeepInfra", "https://api.deepinfra.com/v1/openai", "DEEPINFRA_API_KEY"),
+    ("openai", "OpenAI", "https://api.openai.com/v1", "OPENAI_API_KEY"),
+    ("together", "Together AI", "https://api.together.xyz/v1", "TOGETHER_API_KEY"),
+    ("groq", "Groq", "https://api.groq.com/openai/v1", "GROQ_API_KEY"),
+    ("fireworks", "Fireworks AI", "https://api.fireworks.ai/inference/v1", "FIREWORKS_API_KEY"),
+    ("mistral", "Mistral", "https://api.mistral.ai/v1", "MISTRAL_API_KEY"),
+    ("deepseek", "DeepSeek", "https://api.deepseek.com/v1", "DEEPSEEK_API_KEY"),
+    ("xai", "xAI", "https://api.x.ai/v1", "XAI_API_KEY"),
+    ("cerebras", "Cerebras", "https://api.cerebras.ai/v1", "CEREBRAS_API_KEY"),
+    ("hyperbolic", "Hyperbolic", "https://api.hyperbolic.xyz/v1", "HYPERBOLIC_API_KEY"),
+];
 
 /// Turn a display name into a provider id that doesn't collide with existing ones.
 pub fn unique_provider_id(cfg: &Config, wanted: &str) -> String {

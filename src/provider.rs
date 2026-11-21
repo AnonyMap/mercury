@@ -3,9 +3,11 @@
 //! Written against the behaviour of the servers people actually run locally (Ollama, LM Studio,
 //! llama.cpp, vLLM, KoboldCpp) as well as hosted ones: reasoning can arrive as
 //! `reasoning_content`, `reasoning`, or inline `<think>` tags; some servers reject
-//! `stream_options`; some ignore `stream: true` and answer with plain JSON.
+//! `stream_options`; some ignore `stream: true` and answer with plain JSON. Hosted ones (DeepInfra,
+//! OpenRouter, Together…) answer 429 when busy, so requests are retried with back-off until the
+//! first token arrives; after that a broken stream keeps what was received.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -53,11 +55,19 @@ pub struct Message {
     pub name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<String>,
+    /// Attached images as `data:` URLs (user messages; sent as `image_url` parts).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<String>,
 }
 
 impl Message {
     fn new(role: Role, content: impl Into<String>) -> Self {
-        Self { role, content: Some(content.into()), tool_calls: vec![], tool_call_id: None, name: None, reasoning: None }
+        Self { role, content: Some(content.into()), tool_calls: vec![], tool_call_id: None, name: None, reasoning: None, images: vec![] }
+    }
+    pub fn user_with_images(c: impl Into<String>, images: Vec<String>) -> Self {
+        let mut m = Self::new(Role::User, c);
+        m.images = images;
+        m
     }
     pub fn system(c: impl Into<String>) -> Self {
         Self::new(Role::System, c)
@@ -81,6 +91,12 @@ impl Message {
     /// The wire form: only fields the chat-completions API defines.
     pub fn to_api(&self) -> Value {
         let mut v = json!({ "role": self.role });
+        if !self.images.is_empty() {
+            let mut parts = vec![json!({ "type": "text", "text": self.text() })];
+            parts.extend(self.images.iter().map(|u| json!({ "type": "image_url", "image_url": { "url": u } })));
+            v["content"] = Value::Array(parts);
+            return v;
+        }
         match (&self.content, self.tool_calls.is_empty()) {
             (Some(c), _) if !c.is_empty() => v["content"] = json!(c),
             (_, false) => v["content"] = Value::Null,
@@ -125,6 +141,12 @@ pub enum StreamDelta {
         index: usize,
         name: String,
     },
+    /// The server was busy or unreachable; trying again after `wait`.
+    Retrying {
+        attempt: u32,
+        wait: Duration,
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, Default)]
@@ -145,7 +167,13 @@ impl Completion {
             tool_call_id: None,
             name: None,
             reasoning: (!self.reasoning.is_empty()).then_some(self.reasoning),
+            images: vec![],
         }
+    }
+
+    /// The reply stopped because it hit the output-token limit (DeepInfra caps most models at 16k).
+    pub fn truncated(&self) -> bool {
+        matches!(self.finish_reason.as_deref(), Some("length" | "max_tokens"))
     }
 }
 
@@ -161,6 +189,11 @@ pub enum ProviderError {
     Http { status: u16, url: String, body: String },
     #[error("bad response: {0}")]
     Protocol(String),
+    #[error("the server stopped sending for {0} s")]
+    Stalled(u64),
+    /// The stream broke after some of the reply arrived; `partial` holds what did.
+    #[error("the reply was cut off: {reason}")]
+    Interrupted { partial: Box<Completion>, reason: String },
     #[error("cancelled")]
     Cancelled,
 }
@@ -168,6 +201,112 @@ pub enum ProviderError {
 impl ProviderError {
     pub fn is_auth(&self) -> bool {
         matches!(self, ProviderError::Http { status: 401 | 403, .. })
+    }
+
+    /// Worth trying again: unreachable, overloaded, rate-limited, gateway errors, a stall before
+    /// anything arrived. Not: bad requests, auth, unknown models.
+    pub fn is_transient(&self) -> bool {
+        match self {
+            ProviderError::Connect { .. } | ProviderError::Stalled(_) => true,
+            ProviderError::Http { status, body, .. } => {
+                matches!(status, 408 | 409 | 425 | 429 | 500 | 502 | 503 | 504 | 520..=524 | 529)
+                    && !body.contains("insufficient_quota")
+                    && !body.contains("context_length")
+            }
+            ProviderError::Protocol(m) => m.contains("overloaded") || m.contains("rate limit"),
+            _ => false,
+        }
+    }
+}
+
+/// One entry from `GET /models`, with whatever metadata the server volunteers.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelInfo {
+    pub id: String,
+    /// Context window in tokens, when the server says (DeepInfra, OpenRouter, LM Studio, llama.cpp).
+    pub context_length: Option<u32>,
+    /// Capability/surface tags, e.g. DeepInfra's `chat`, `vision`, `reasoning_effort`.
+    pub tags: Vec<String>,
+}
+
+const CHAT_TAGS: &[&str] = &["chat", "text-generation", "vlm", "llm", "completion", "instruct"];
+const NON_CHAT_TAGS: &[&str] = &[
+    "image-gen",
+    "text-to-image",
+    "image-to-image",
+    "embeddings",
+    "embedding",
+    "tts",
+    "text-to-speech",
+    "speech-to-text",
+    "automatic-speech-recognition",
+    "asr",
+    "stt",
+    "rerank",
+    "reranker",
+    "text-to-video",
+    "video-gen",
+    "image-classification",
+    "object-detection",
+    "token-classification",
+    "fill-mask",
+    "zero-shot-image-classification",
+    "moderation",
+];
+
+impl ModelInfo {
+    pub fn new(id: impl Into<String>) -> Self {
+        Self { id: id.into(), ..Self::default() }
+    }
+    fn has(&self, t: &str) -> bool {
+        self.tags.iter().any(|x| x.eq_ignore_ascii_case(t))
+    }
+    /// Can it chat? Hosted catalogs also list image, speech and embedding models.
+    pub fn is_chat(&self) -> bool {
+        let lower = self.id.to_ascii_lowercase();
+        if lower.contains("embed") && !lower.contains("chat") && self.tags.is_empty() {
+            return false;
+        }
+        self.tags.is_empty() || CHAT_TAGS.iter().any(|t| self.has(t)) || !NON_CHAT_TAGS.iter().any(|t| self.has(t))
+    }
+    pub fn vision(&self) -> bool {
+        self.has("vision") || self.has("vlm") || self.has("image-text-to-text")
+    }
+    pub fn reasoning(&self) -> bool {
+        self.has("reasoning") || self.has("reasoning_effort")
+    }
+}
+
+/// Per-provider request options.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClientOptions {
+    /// Extra HTTP headers (OpenRouter's `HTTP-Referer`, gateway keys…).
+    pub headers: Vec<(String, String)>,
+    /// Extra top-level JSON fields merged into every chat request (`service_tier`, `top_k`…).
+    pub extra_body: serde_json::Map<String, Value>,
+    /// `reasoning_effort` for reasoning models: none / low / medium / high.
+    pub reasoning_effort: Option<String>,
+    /// Attempts after the first for transient failures before any output arrives.
+    pub retries: u32,
+    /// First back-off; doubles each time (capped at 30 s). A `Retry-After` header wins.
+    pub retry_base: Duration,
+    /// How long to wait for the first byte of a reply (a local server may be loading the model).
+    pub first_token_timeout: Duration,
+    /// How long a started stream may go quiet before it's treated as dead.
+    pub idle_timeout: Duration,
+}
+
+impl Default for ClientOptions {
+    fn default() -> Self {
+        Self {
+            headers: vec![],
+            extra_body: serde_json::Map::new(),
+            reasoning_effort: None,
+            retries: 3,
+            retry_base: Duration::from_secs(1),
+            first_token_timeout: Duration::from_secs(600),
+            idle_timeout: Duration::from_secs(180),
+        }
     }
 }
 
@@ -184,34 +323,51 @@ pub struct Client {
     http: reqwest::Client,
     base_url: String,
     api_key: Option<String>,
+    opts: ClientOptions,
 }
 
 impl Client {
     pub fn new(base_url: &str, api_key: Option<String>) -> Self {
+        Self::with_options(base_url, api_key, ClientOptions::default())
+    }
+
+    pub fn with_options(base_url: &str, api_key: Option<String>, opts: ClientOptions) -> Self {
         let http = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(10))
             .user_agent(concat!("Mercury/", env!("CARGO_PKG_VERSION")))
             .build()
             .expect("http client");
-        Self { http, base_url: base_url.trim_end_matches('/').to_string(), api_key }
+        Self { http, base_url: base_url.trim_end_matches('/').to_string(), api_key, opts }
     }
 
     pub fn base_url(&self) -> &str {
         &self.base_url
     }
 
-    fn auth(&self, rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    pub fn options(&self) -> &ClientOptions {
+        &self.opts
+    }
+
+    fn auth(&self, mut rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        for (k, v) in &self.opts.headers {
+            rb = rb.header(k.as_str(), v.as_str());
+        }
         match &self.api_key {
             Some(k) => rb.bearer_auth(k),
             None => rb,
         }
     }
 
-    /// `GET /models`, sorted ids.
+    /// `GET /models`, sorted ids of the models that can chat.
     pub async fn list_models(&self) -> Result<Vec<String>, ProviderError> {
+        Ok(self.list_model_info().await?.into_iter().map(|m| m.id).collect())
+    }
+
+    /// `GET /models` with metadata; image/speech/embedding models are left out.
+    pub async fn list_model_info(&self) -> Result<Vec<ModelInfo>, ProviderError> {
         let url = format!("{}/models", self.base_url);
         let resp = self
-            .auth(self.http.get(&url).timeout(Duration::from_secs(15)))
+            .auth(self.http.get(&url).timeout(Duration::from_secs(20)))
             .send()
             .await
             .map_err(|source| ProviderError::Connect { url: url.clone(), source })?;
@@ -220,22 +376,53 @@ impl Client {
         if !status.is_success() {
             return Err(ProviderError::Http { status: status.as_u16(), url, body: truncate(&body, 500) });
         }
-        parse_model_list(&body)
+        Ok(parse_model_info(&body)?.into_iter().filter(ModelInfo::is_chat).collect())
     }
 
-    /// Stream a chat completion, calling `on_delta` for visible progress.
+    /// Stream a chat completion, calling `on_delta` for visible progress. Transient failures
+    /// (busy, rate-limited, unreachable, stalled) are retried with back-off as long as nothing has
+    /// been shown yet; a stream that breaks later returns [`ProviderError::Interrupted`].
     pub async fn chat_stream(
         &self,
         req: &ChatRequest,
         cancel: &CancellationToken,
         on_delta: &mut (dyn FnMut(StreamDelta) + Send),
     ) -> Result<Completion, ProviderError> {
-        match self.chat_stream_inner(req, true, cancel, on_delta).await {
-            Err(ProviderError::Http { status: 400 | 422, ref body, .. }) if body.contains("stream_options") => {
-                self.chat_stream_inner(req, false, cancel, on_delta).await
+        let mut include_usage = true;
+        let mut attempt = 0u32;
+        loop {
+            let mut emitted = false;
+            let mut tracked = |d: StreamDelta| {
+                emitted = true;
+                on_delta(d)
+            };
+            let r = self.chat_stream_inner(req, include_usage, cancel, &mut tracked).await;
+            match r {
+                Err(ProviderError::Http { status: 400 | 422, ref body, .. }) if include_usage && body.contains("stream_options") => {
+                    include_usage = false;
+                }
+                Err(ref e) if !emitted && e.is_transient() && attempt < self.opts.retries => {
+                    attempt += 1;
+                    let wait = self.backoff(attempt, e);
+                    on_delta(StreamDelta::Retrying { attempt, wait, reason: short_reason(e) });
+                    tokio::select! {
+                        _ = tokio::time::sleep(wait) => {}
+                        _ = cancel.cancelled() => return Err(ProviderError::Cancelled),
+                    }
+                }
+                other => return other,
             }
-            other => other,
         }
+    }
+
+    fn backoff(&self, attempt: u32, e: &ProviderError) -> Duration {
+        if let ProviderError::Http { body, .. } = e
+            && let Some(secs) =
+                body.strip_prefix("retry-after:").and_then(|r| r.split_whitespace().next()).and_then(|n| n.parse::<f64>().ok())
+        {
+            return Duration::from_secs_f64(secs.clamp(0.0, 30.0));
+        }
+        (self.opts.retry_base * 2u32.saturating_pow(attempt - 1)).min(Duration::from_secs(30))
     }
 
     async fn chat_stream_inner(
@@ -261,15 +448,31 @@ impl Client {
         if let Some(t) = req.temperature {
             body["temperature"] = json!(t);
         }
+        if let Some(e) = self.opts.reasoning_effort.as_deref().filter(|e| !e.is_empty()) {
+            body["reasoning_effort"] = json!(e);
+        }
+        for (k, v) in &self.opts.extra_body {
+            body[k] = v.clone();
+        }
         let send = self.auth(self.http.post(&url).json(&body)).send();
+        let first = self.opts.first_token_timeout;
         let resp = tokio::select! {
-            r = send => r.map_err(|source| ProviderError::Connect { url: url.clone(), source })?,
+            r = tokio::time::timeout(first, send) => match r {
+                Ok(r) => r.map_err(|source| ProviderError::Connect { url: url.clone(), source })?,
+                Err(_) => return Err(ProviderError::Stalled(first.as_secs())),
+            },
             _ = cancel.cancelled() => return Err(ProviderError::Cancelled),
         };
         let status = resp.status();
         if !status.is_success() {
+            let retry_after = resp.headers().get(reqwest::header::RETRY_AFTER).and_then(|v| v.to_str().ok()).map(str::to_string);
             let body = resp.text().await.unwrap_or_default();
-            return Err(ProviderError::Http { status: status.as_u16(), url, body: truncate(&body, 2000) });
+            let body = match retry_after {
+                // Carried in the body so `backoff` can honour it without another error field.
+                Some(ra) => format!("retry-after:{ra} {}", truncate(&body, 2000)),
+                None => truncate(&body, 2000),
+            };
+            return Err(ProviderError::Http { status: status.as_u16(), url, body });
         }
         let is_sse = resp
             .headers()
@@ -290,18 +493,33 @@ impl Client {
 
         let mut stream = resp.bytes_stream();
         let mut parser = SseParser::default();
+        let mut got_any = false;
+        let started = Instant::now();
         loop {
+            // Before the first token a model may still be loading; after it, silence means trouble.
+            let limit = if got_any { self.opts.idle_timeout } else { first.saturating_sub(started.elapsed()).max(Duration::from_secs(1)) };
             let chunk = tokio::select! {
-                c = stream.next() => c,
+                c = tokio::time::timeout(limit, stream.next()) => match c {
+                    Ok(c) => c,
+                    Err(_) if acc.has_output() => return Err(acc.interrupted(format!("no data for {} s", limit.as_secs()))),
+                    Err(_) => return Err(ProviderError::Stalled(limit.as_secs())),
+                },
                 _ = cancel.cancelled() => return Err(ProviderError::Cancelled),
             };
             let Some(chunk) = chunk else { break };
-            let chunk = chunk.map_err(|e| ProviderError::Protocol(format!("stream error: {e}")))?;
+            let chunk = match chunk {
+                Ok(c) => c,
+                Err(e) if acc.has_output() => return Err(acc.interrupted(format!("connection dropped: {e}"))),
+                Err(e) => return Err(ProviderError::Protocol(format!("stream error: {e}"))),
+            };
             for data in parser.push(&chunk) {
                 if data.trim() == "[DONE]" {
                     return Ok(acc.finish());
                 }
-                acc.absorb_chunk(&data, on_delta)?;
+                if let Err(e) = acc.absorb_chunk(&data, on_delta) {
+                    return Err(if acc.has_output() { acc.interrupted(e.to_string()) } else { e });
+                }
+                got_any = true;
             }
         }
         for data in parser.finish() {
@@ -321,19 +539,58 @@ impl Client {
 }
 
 pub fn parse_model_list(body: &str) -> Result<Vec<String>, ProviderError> {
+    Ok(parse_model_info(body)?.into_iter().map(|m| m.id).collect())
+}
+
+/// Parse a model listing: OpenAI (`data`), Ollama (`models`), DeepInfra (`metadata.tags`,
+/// `metadata.context_length`), OpenRouter (`context_length`), LM Studio (`max_context_length`),
+/// llama.cpp (`meta.n_ctx_train`). Sorted by id, duplicates removed. Non-chat models are kept here.
+pub fn parse_model_info(body: &str) -> Result<Vec<ModelInfo>, ProviderError> {
     let v: Value = serde_json::from_str(body).map_err(|e| ProviderError::Protocol(format!("models: {e}")))?;
     let arr = v
         .get("data")
         .or_else(|| v.get("models"))
         .and_then(Value::as_array)
         .ok_or_else(|| ProviderError::Protocol("models: no `data` array".into()))?;
-    let mut ids: Vec<String> = arr
+    let num = |x: Option<&Value>| x.and_then(Value::as_u64).filter(|n| *n > 0).map(|n| n.min(u32::MAX as u64) as u32);
+    let mut out: Vec<ModelInfo> = arr
         .iter()
-        .filter_map(|m| m.get("id").or_else(|| m.get("name")).or_else(|| m.get("model")).and_then(Value::as_str).map(str::to_string))
+        .filter_map(|m| {
+            let id = m.get("id").or_else(|| m.get("name")).or_else(|| m.get("model")).and_then(Value::as_str)?.to_string();
+            let meta = m.get("metadata").filter(|x| x.is_object());
+            let context_length = num(m.get("context_length"))
+                .or_else(|| num(meta.and_then(|x| x.get("context_length"))))
+                .or_else(|| num(m.get("max_context_length")))
+                .or_else(|| num(m.get("context_window")))
+                .or_else(|| num(m.get("meta").and_then(|x| x.get("n_ctx_train"))))
+                .or_else(|| num(m.get("top_provider").and_then(|x| x.get("context_length"))));
+            let mut tags: Vec<String> = meta
+                .and_then(|x| x.get("tags"))
+                .or_else(|| m.get("tags"))
+                .and_then(Value::as_array)
+                .map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect())
+                .unwrap_or_default();
+            // LM Studio: "type": "llm" | "vlm" | "embeddings".
+            if let Some(t) = m.get("type").and_then(Value::as_str) {
+                tags.push(t.to_string());
+            }
+            Some(ModelInfo { id, context_length, tags })
+        })
         .collect();
-    ids.sort();
-    ids.dedup();
-    Ok(ids)
+    out.sort_by(|a, b| a.id.cmp(&b.id));
+    out.dedup_by(|a, b| a.id == b.id);
+    Ok(out)
+}
+
+fn short_reason(e: &ProviderError) -> String {
+    match e {
+        ProviderError::Connect { .. } => "can't reach the server".into(),
+        ProviderError::Stalled(s) => format!("no reply for {s} s"),
+        ProviderError::Http { status: 429, body, .. } if body.contains("overloaded") => "the model is overloaded".into(),
+        ProviderError::Http { status: 429, .. } => "rate limited".into(),
+        ProviderError::Http { status, .. } => format!("server error {status}"),
+        other => other.to_string(),
+    }
 }
 
 pub fn truncate(s: &str, max: usize) -> String {
@@ -476,6 +733,20 @@ struct Accumulator {
 }
 
 impl Accumulator {
+    fn has_output(&self) -> bool {
+        !self.content.is_empty() || !self.reasoning.is_empty() || !self.calls.is_empty() || !self.think.pending.is_empty()
+    }
+
+    /// What arrived before the stream broke. Half-streamed tool calls are dropped: their
+    /// arguments are probably incomplete JSON.
+    fn interrupted(&mut self, reason: String) -> ProviderError {
+        let mut acc = std::mem::take(self);
+        acc.calls.clear();
+        let mut partial = acc.finish();
+        partial.finish_reason = Some("error".into());
+        ProviderError::Interrupted { partial: Box::new(partial), reason }
+    }
+
     fn text(&mut self, piece: &str, on_delta: &mut (dyn FnMut(StreamDelta) + Send)) {
         let (t, r) = self.think.push(piece);
         self.emit(t, r, on_delta);

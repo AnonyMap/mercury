@@ -14,7 +14,6 @@ use crate::config::{ApprovalMode, Config, Paths, ProviderConfig};
 use crate::memory::{MemoryStore, Target};
 use crate::provider::{ChatRequest, Client, Message, ProviderError, Role, StreamDelta, Usage};
 use crate::session::{SessionMeta, SessionStore, title_from};
-use crate::skills::SkillLibrary;
 use crate::tools::{self, ToolContext};
 
 pub enum AgentEvent {
@@ -53,6 +52,11 @@ pub enum AgentEvent {
     /// The transcript was rewritten (compression); reload it from the agent.
     TranscriptReplaced,
     Usage(Usage),
+    /// How full the context is: prompt tokens of the last request against the window.
+    Context {
+        used: u64,
+        window: u32,
+    },
     Notice(String),
     Error(String),
     TurnFinished,
@@ -72,6 +76,7 @@ impl std::fmt::Debug for AgentEvent {
             Self::Committed(m) => write!(f, "Committed({:?})", m.role),
             Self::TranscriptReplaced => write!(f, "TranscriptReplaced"),
             Self::Usage(u) => write!(f, "Usage({})", u.total_tokens),
+            Self::Context { used, window } => write!(f, "Context({used}/{window})"),
             Self::Notice(s) => write!(f, "Notice({s})"),
             Self::Error(s) => write!(f, "Error({s})"),
             Self::TurnFinished => write!(f, "TurnFinished"),
@@ -179,7 +184,14 @@ pub struct Agent {
     memory_snapshot: String,
     /// 0 for the main agent, 1 for a subagent spawned by `delegate_task`.
     pub depth: u8,
+    /// Context windows reported by servers' model lists, keyed `provider/model`.
+    pub model_context: std::collections::HashMap<String, u32>,
+    /// Images to attach to the next user message (and kept across `/retry`).
+    pub pending_images: Vec<String>,
 }
+
+/// Roughly what one attached image costs in prompt tokens.
+const IMAGE_TOKENS: usize = 1_000;
 
 fn estimate_tokens(msgs: &[Message], system: &str) -> usize {
     let chars: usize = system.len()
@@ -187,7 +199,7 @@ fn estimate_tokens(msgs: &[Message], system: &str) -> usize {
             .iter()
             .map(|m| m.text().len() + m.tool_calls.iter().map(|c| c.function.arguments.len() + c.function.name.len()).sum::<usize>() + 8)
             .sum::<usize>();
-    chars / 4
+    chars / 4 + msgs.iter().map(|m| m.images.len() * IMAGE_TOKENS).sum::<usize>()
 }
 
 impl Agent {
@@ -216,7 +228,7 @@ impl Agent {
         let tools = ToolContext::new(
             workdir,
             MemoryStore::new(config.memories_dir(&paths)),
-            SkillLibrary::new(config.skills_dir(&paths), config.extra_skill_dirs.clone()),
+            config.skill_library(&paths),
             sessions.clone(),
             &session.id,
             config.tools.clone(),
@@ -224,8 +236,20 @@ impl Agent {
         );
         let usage = session.usage.clone();
         let memory_snapshot = tools.memory.snapshot();
-        let mut a =
-            Self { paths, config, sessions, session, messages, tools, usage, system_prompt: String::new(), memory_snapshot, depth: 0 };
+        let mut a = Self {
+            paths,
+            config,
+            sessions,
+            session,
+            messages,
+            tools,
+            usage,
+            system_prompt: String::new(),
+            memory_snapshot,
+            depth: 0,
+            model_context: Default::default(),
+            pending_images: vec![],
+        };
         a.system_prompt = a.build_system_prompt();
         Ok(a)
     }
@@ -259,7 +283,7 @@ impl Agent {
     pub fn apply_config(&mut self, config: Config) {
         self.tools.config = config.tools.clone();
         self.tools.memory = MemoryStore::new(config.memories_dir(&self.paths));
-        self.tools.skills = SkillLibrary::new(config.skills_dir(&self.paths), config.extra_skill_dirs.clone());
+        self.tools.skills = config.skill_library(&self.paths);
         if config.mcp_servers != self.config.mcp_servers
             && let Ok(mut g) = self.tools.mcp.try_write()
         {
@@ -343,12 +367,40 @@ impl Agent {
     pub async fn client(&self) -> Result<(Client, ProviderConfig)> {
         let p = self.provider()?;
         let (base, key) = crate::nous::credentials(&self.paths, &p).await?;
-        Ok((Client::new(&base, key), p))
+        let opts = p.client_options(&self.config.agent);
+        Ok((Client::with_options(&base, key, opts), p))
     }
 
-    pub async fn list_models(&self) -> Result<Vec<String>> {
-        let (c, _) = self.client().await?;
-        Ok(c.list_models().await?)
+    pub async fn list_models(&mut self) -> Result<Vec<String>> {
+        Ok(self.list_model_info().await?.into_iter().map(|m| m.id).collect())
+    }
+
+    /// Model list with metadata; remembers reported context windows for compression.
+    pub async fn list_model_info(&mut self) -> Result<Vec<crate::provider::ModelInfo>> {
+        let (c, p) = self.client().await?;
+        let list = c.list_model_info().await?;
+        for m in &list {
+            if let Some(n) = m.context_length {
+                self.model_context.insert(format!("{}/{}", p.id, m.id), n);
+            }
+        }
+        Ok(list)
+    }
+
+    /// The context window to plan for: the provider's setting, else what the server reported for
+    /// this model, else the global default.
+    pub fn context_window(&self) -> u32 {
+        let Ok(p) = self.provider() else { return self.config.agent.default_context_window };
+        if p.context_window > 0 {
+            return p.context_window;
+        }
+        let model = self.config.active_model_name().unwrap_or_default();
+        self.model_context.get(&format!("{}/{model}", p.id)).copied().unwrap_or(self.config.agent.default_context_window)
+    }
+
+    /// Estimated tokens the next request will send.
+    pub fn context_estimate(&self) -> usize {
+        estimate_tokens(&self.messages, &self.system_prompt)
     }
 
     fn commit(&mut self, m: Message, ev: &Events) {
@@ -365,6 +417,9 @@ impl Agent {
         if let Err(e) = self.run_turn_inner(user_text, ev, cancel).await {
             let msg = match e.downcast_ref::<ProviderError>() {
                 Some(ProviderError::Cancelled) => None,
+                Some(ProviderError::Stalled(s)) => Some(format!(
+                    "The server didn't answer for {s} s. It may still be loading the model or be overloaded; try /retry, or raise the stall timeout in Settings > Tools & safety."
+                )),
                 Some(pe) if pe.is_auth() => {
                     Some(format!("{pe}\n\nThe provider rejected the credentials. Check the API key, or sign in to Nous Portal again."))
                 }
@@ -400,7 +455,8 @@ impl Agent {
             self.session.model = model.clone();
             self.session.provider = provider.id.clone();
         }
-        self.commit(Message::user(user_text), ev);
+        let images = std::mem::take(&mut self.pending_images);
+        self.commit(Message::user_with_images(user_text, images), ev);
         self.maybe_compress(&client, &provider, &model, ev, cancel).await?;
 
         let mut send_tools = provider.tools;
@@ -424,6 +480,9 @@ impl Agent {
                     StreamDelta::Text(t) => AgentEvent::TextDelta(t),
                     StreamDelta::Reasoning(r) => AgentEvent::ReasoningDelta(r),
                     StreamDelta::ToolCallStarted { name, .. } => AgentEvent::ToolCallStreaming { name },
+                    StreamDelta::Retrying { attempt, wait, reason } => {
+                        AgentEvent::Notice(format!("{reason}; trying again in {} s (attempt {attempt}).", wait.as_secs_f32().ceil() as u64))
+                    }
                 });
             };
             let completion = match client.chat_stream(&req, cancel, &mut on_delta).await {
@@ -435,13 +494,26 @@ impl Agent {
                     let req = ChatRequest { tools: vec![], ..req };
                     client.chat_stream(&req, cancel, &mut on_delta).await?
                 }
+                Err(ProviderError::Interrupted { partial, reason }) => {
+                    // Keep what arrived; the user can /continue or /retry.
+                    let msg = partial.into_message();
+                    if !msg.text().is_empty() || msg.reasoning.is_some() {
+                        self.commit(msg, ev);
+                    }
+                    let _ = ev.send(AgentEvent::Error(format!(
+                        "The reply was cut off ({reason}). What arrived is kept; /continue picks up from there, /retry starts over."
+                    )));
+                    return Ok(());
+                }
                 other => other?,
             };
             if let Some(u) = &completion.usage {
                 self.usage.add(u);
                 let _ = self.sessions.add_usage(&self.session.id, u);
                 let _ = ev.send(AgentEvent::Usage(self.usage.clone()));
+                let _ = ev.send(AgentEvent::Context { used: u.prompt_tokens + u.completion_tokens, window: self.context_window() });
             }
+            let truncated = completion.truncated();
             let calls = completion.tool_calls.clone();
             let msg = completion.into_message();
             if msg.text().is_empty() && calls.is_empty() {
@@ -449,6 +521,10 @@ impl Agent {
             }
             self.commit(msg, ev);
             if calls.is_empty() {
+                if truncated {
+                    let _ =
+                        ev.send(AgentEvent::Notice("The reply hit the model's output limit. /continue picks up where it stopped.".into()));
+                }
                 return Ok(());
             }
             for call in calls {
@@ -748,7 +824,8 @@ impl Agent {
         ev: &Events,
         cancel: &CancellationToken,
     ) -> Result<()> {
-        let window = if provider.context_window > 0 { provider.context_window } else { self.config.agent.default_context_window } as usize;
+        let _ = provider;
+        let window = self.context_window() as usize;
         let est = estimate_tokens(&self.messages, &self.system_prompt);
         if (est as f32) < window as f32 * self.config.agent.compression_threshold {
             return Ok(());
@@ -843,6 +920,7 @@ impl Agent {
     pub fn pop_last_exchange(&mut self) -> Result<Option<String>> {
         let Some(i) = self.messages.iter().rposition(|m| m.role == Role::User) else { return Ok(None) };
         let text = self.messages[i].text().to_string();
+        self.pending_images = self.messages[i].images.clone();
         self.messages.truncate(i);
         self.sessions.replace_messages(&self.session.id, &self.messages)?;
         Ok(Some(text))
@@ -875,8 +953,18 @@ impl Agent {
                 Some(t) => Send(t),
                 None => Text("Nothing to retry.".into()),
             },
+            Command::Continue => {
+                if self.messages.last().is_some_and(|m| m.role == Role::Assistant) {
+                    Send("Continue exactly where you stopped, without repeating what you already wrote.".into())
+                } else {
+                    Text("Nothing to continue.".into())
+                }
+            }
             Command::Undo => match self.pop_last_exchange()? {
-                Some(_) => Reload("Removed the last exchange.".into()),
+                Some(_) => {
+                    self.pending_images.clear();
+                    Reload("Removed the last exchange.".into())
+                }
                 None => Text("Nothing to undo.".into()),
             },
             Command::Compress => {

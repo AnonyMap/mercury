@@ -11,6 +11,7 @@ use axum::extract::{Form, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
+use futures_util::StreamExt;
 use mercury::agent::{Agent, AgentEvent};
 use mercury::config::{Config, Paths, ProviderConfig};
 use rusqlite::params;
@@ -26,6 +27,10 @@ pub enum Reply {
     /// Non-JSON body with extra headers (edge firewall responses).
     Raw(u16, String, Vec<(String, String)>),
     Json(u16, Value),
+    /// SSE events, then the connection is cut (no `[DONE]`, no clean end).
+    SseThenDrop(Vec<String>),
+    /// SSE events, then silence for this many ms before the stream ends.
+    SseThenStall(Vec<String>, u64),
 }
 
 pub type TokenRequest = (Vec<(String, String)>, HeaderMap);
@@ -36,6 +41,8 @@ pub struct MockState {
     pub chat_headers: Mutex<Vec<HeaderMap>>,
     pub chat_script: Mutex<VecDeque<Reply>>,
     pub models: Mutex<Vec<String>>,
+    /// Replaces the generated model list (e.g. a DeepInfra-shaped one with metadata).
+    pub models_json: Mutex<Option<Value>>,
     pub token_script: Mutex<VecDeque<Reply>>,
     pub token_requests: Mutex<Vec<TokenRequest>>,
     pub device_requests: Mutex<Vec<Vec<(String, String)>>>,
@@ -83,6 +90,26 @@ fn reply(r: Reply) -> Response {
             b.body(Body::from(body)).unwrap()
         }
         Reply::Json(code, v) => (StatusCode::from_u16(code).unwrap(), axum::Json(v)).into_response(),
+        Reply::SseThenDrop(events) => {
+            let mut items: Vec<Result<String, std::io::Error>> = events.into_iter().map(|e| Ok(format!("data: {e}\n\n"))).collect();
+            items.push(Err(std::io::Error::other("connection cut")));
+            let stream = futures_util::stream::iter(items).then(|x| async move {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                x
+            });
+            Response::builder().header("content-type", "text/event-stream").body(Body::from_stream(stream)).unwrap()
+        }
+        Reply::SseThenStall(events, ms) => {
+            let n = events.len();
+            let stream = futures_util::stream::iter(events.into_iter().enumerate()).then(move |(i, e)| async move {
+                if i + 1 == n {
+                    tokio::time::sleep(Duration::from_millis(ms)).await;
+                }
+                Ok::<_, std::io::Error>(format!("data: {e}\n\n"))
+            });
+            // The last event only arrives after the stall, so the client sees silence first.
+            Response::builder().header("content-type", "text/event-stream").body(Body::from_stream(stream)).unwrap()
+        }
     }
 }
 
@@ -94,6 +121,9 @@ async fn chat(State(s): State<Arc<MockState>>, headers: HeaderMap, axum::Json(bo
 }
 
 async fn models(State(s): State<Arc<MockState>>) -> Response {
+    if let Some(v) = s.models_json.lock().unwrap().clone() {
+        return axum::Json(v).into_response();
+    }
     let data: Vec<Value> = s.models.lock().unwrap().iter().map(|m| json!({"id": m, "object": "model"})).collect();
     axum::Json(json!({"object": "list", "data": data})).into_response()
 }
@@ -194,6 +224,8 @@ pub fn harness(base_url: &str) -> (Harness, Config) {
     cfg.upsert_provider(p);
     cfg.set_active("mock", Some("test-model".into()));
     cfg.agent.workdir = Some(work.clone());
+    // Scripted servers answer instantly; back-off would only slow the tests down.
+    cfg.agent.retry_base_ms = 10;
     (Harness { dir, paths, work }, cfg)
 }
 

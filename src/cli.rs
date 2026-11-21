@@ -35,6 +35,21 @@ pub enum ProfileCmd {
         #[arg(long)]
         yes: bool,
     },
+    /// Save a profile (chats, memory, skills, settings; no API keys) as a .tar.gz.
+    Export {
+        /// Profile to export (default: the active one).
+        name: Option<String>,
+        /// Output file (default: mercury-<profile>-<date>.tar.gz here).
+        #[arg(short, long)]
+        out: Option<std::path::PathBuf>,
+    },
+    /// Add a profile from an exported .tar.gz.
+    Import {
+        file: std::path::PathBuf,
+        /// Name for the new profile (default: the name it was exported under).
+        #[arg(long = "as")]
+        name: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -54,6 +69,9 @@ pub enum Cmd {
         /// Run dangerous commands without asking.
         #[arg(long)]
         yolo: bool,
+        /// Attach a file to the first message: images for vision models, text/code inlined.
+        #[arg(short, long = "attach")]
+        attach: Vec<std::path::PathBuf>,
     },
     /// Sign in to Nous Portal (device code).
     Login,
@@ -69,10 +87,11 @@ pub enum Cmd {
         #[arg(long)]
         add: bool,
     },
-    /// Add an OpenAI-compatible endpoint.
+    /// Add an OpenAI-compatible endpoint. Known services need no URL: `mercury add-provider deepinfra`.
     AddProvider {
         name: String,
-        url: String,
+        /// Base URL (ends in /v1 for most servers). Optional for presets (see `mercury presets`).
+        url: Option<String>,
         #[arg(long)]
         key: Option<String>,
         #[arg(long)]
@@ -87,6 +106,40 @@ pub enum Cmd {
     Use { provider: String, model: Option<String> },
     /// List configured providers.
     Providers,
+    /// Hosted services Mercury knows the address of (DeepInfra, OpenRouter, Groq…).
+    Presets,
+    /// Check that a provider works: lists models and sends a one-word test message.
+    TestProvider {
+        /// Provider id (default: the active one).
+        id: Option<String>,
+        #[arg(long)]
+        model: Option<String>,
+    },
+    /// Change a provider's request options.
+    ConfigureProvider {
+        id: String,
+        /// none | low | medium | high, or "default" to stop sending it.
+        #[arg(long)]
+        effort: Option<String>,
+        /// Extra header, "Name: value" (repeatable; "Name:" removes one).
+        #[arg(long = "header")]
+        headers: Vec<String>,
+        /// Extra JSON fields for every request, e.g. '{"service_tier":"flex"}' ("{}" clears).
+        #[arg(long)]
+        extra_json: Option<String>,
+        /// Context window in tokens (0 = what the server reports).
+        #[arg(long)]
+        context_window: Option<u32>,
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long)]
+        key: Option<String>,
+        #[arg(long)]
+        key_env: Option<String>,
+        /// Turn tool calling on or off.
+        #[arg(long)]
+        tools: Option<bool>,
+    },
     /// Give a provider a label (e.g. "Basement GPU", "Laptop Ollama").
     LabelProvider { id: String, label: String },
     /// Manage profiles: separate chats, memory, skills and model per profile.
@@ -133,9 +186,9 @@ fn rt() -> Result<tokio::runtime::Runtime> {
 pub fn run(cli: Cli, paths: Paths) -> Result<()> {
     paths.ensure()?;
     let mut cfg = Config::load_profile(&paths)?;
-    match cli.command.unwrap_or(Cmd::Chat { query: None, resume: None, model: None, yolo: false }) {
+    match cli.command.unwrap_or(Cmd::Chat { query: None, resume: None, model: None, yolo: false, attach: vec![] }) {
         Cmd::Gui => Err(anyhow!("this build has no GUI")),
-        Cmd::Chat { query, resume, model, yolo } => rt()?.block_on(chat(paths, cfg, query, resume, model, yolo)),
+        Cmd::Chat { query, resume, model, yolo, attach } => rt()?.block_on(chat(paths, cfg, query, resume, model, yolo, attach)),
         Cmd::Login => rt()?.block_on(async {
             let cancel = CancellationToken::new();
             let c2 = cancel.clone();
@@ -155,7 +208,7 @@ pub fn run(cli: Cli, paths: Paths) -> Result<()> {
             println!("Signed in. Inference endpoint: {}", state.inference_base_url);
             let p = cfg.providers.iter().find(|p| p.kind == ProviderKind::NousOauth).cloned().unwrap();
             if let Ok((base, key)) = crate::nous::credentials(&paths, &p).await
-                && let Ok(models) = crate::provider::Client::new(&base, key).list_models().await
+                && let Ok(models) = crate::provider::Client::with_options(&base, key, p.client_options(&cfg.agent)).list_models().await
             {
                 println!("{} models available. Pick one with: mercury use {} <model>", models.len(), p.id);
             }
@@ -172,8 +225,18 @@ pub fn run(cli: Cli, paths: Paths) -> Result<()> {
                 None => cfg.active().cloned().ok_or_else(|| anyhow!("no provider configured; try `mercury discover --add`"))?,
             };
             let (base, key) = crate::nous::credentials(&paths, &p).await?;
-            for m in crate::provider::Client::new(&base, key).list_models().await? {
-                println!("{m}");
+            for m in crate::provider::Client::with_options(&base, key, p.client_options(&cfg.agent)).list_model_info().await? {
+                let mut extra = vec![];
+                if let Some(n) = m.context_length {
+                    extra.push(format!("{}k context", n / 1000));
+                }
+                if m.vision() {
+                    extra.push("vision".into());
+                }
+                if m.reasoning() {
+                    extra.push("reasoning".into());
+                }
+                if extra.is_empty() { println!("{}", m.id) } else { println!("{:<50} {}", m.id, extra.join(", ")) }
             }
             Ok(())
         }),
@@ -206,11 +269,24 @@ pub fn run(cli: Cli, paths: Paths) -> Result<()> {
             Ok(())
         }),
         Cmd::AddProvider { name, url, key, key_env, model, no_tools } => {
+            let preset =
+                crate::config::presets().into_iter().find(|p| p.id.eq_ignore_ascii_case(&name) || p.name.eq_ignore_ascii_case(&name));
+            let (name, url, preset_env) = match (url, &preset) {
+                (Some(u), _) => (name, u, None),
+                (None, Some(p)) => (p.name.clone(), p.base_url.clone(), p.api_key_env.clone()),
+                (None, None) => return Err(anyhow!("give the server's URL, or one of the presets (see `mercury presets`)")),
+            };
             url::Url::parse(&url).map_err(|e| anyhow!("bad URL: {e}"))?;
-            let id = crate::config::unique_provider_id(&cfg, &name);
+            let id = match &preset {
+                Some(p) if cfg.provider(&p.id).is_none() => p.id.clone(),
+                _ => crate::config::unique_provider_id(&cfg, &name),
+            };
             let mut p = ProviderConfig::openai(&id, &name, &url);
+            if let Some(pre) = &preset {
+                p.headers = pre.headers.clone();
+            }
             p.api_key = key;
-            p.api_key_env = key_env;
+            p.api_key_env = key_env.or(if p.api_key.is_none() { preset_env } else { None });
             p.default_model = model.clone().unwrap_or_default();
             p.tools = !no_tools;
             let first = cfg.providers.is_empty();
@@ -229,6 +305,75 @@ pub fn run(cli: Cli, paths: Paths) -> Result<()> {
             }
             cfg.save_profile(&paths)?;
             println!("Using {} / {}", provider, cfg.active_model_name().unwrap_or_else(|| "(pick a model)".into()));
+            Ok(())
+        }
+        Cmd::Presets => {
+            for p in crate::config::presets() {
+                let env = p.api_key_env.map(|e| format!("key from ${e}")).unwrap_or_else(|| "no key".into());
+                println!("{:<12} {:<28} {:<44} {env}", p.id, p.name, p.base_url);
+            }
+            println!(
+                "\nAdd one with: mercury add-provider <id> [--key KEY]. Any other OpenAI-compatible server: mercury add-provider NAME URL"
+            );
+            Ok(())
+        }
+        Cmd::TestProvider { id, model } => rt()?.block_on(async {
+            let p = match id {
+                Some(id) => cfg.provider(&id).cloned().ok_or_else(|| anyhow!("no provider `{id}`"))?,
+                None => cfg.active().cloned().ok_or_else(|| anyhow!("no provider configured"))?,
+            };
+            println!("Testing {} ({})…", p.name, p.base_url);
+            let r = crate::probe::test_provider(&paths, &cfg, &p, model.as_deref()).await;
+            println!("{}", r.summary());
+            if r.ok() { Ok(()) } else { Err(anyhow!("{} isn't working", p.name)) }
+        }),
+        Cmd::ConfigureProvider { id, effort, headers, extra_json, context_window, model, key, key_env, tools } => {
+            let p = cfg.providers.iter_mut().find(|p| p.id == id).ok_or_else(|| anyhow!("no provider `{id}` (see `mercury providers`)"))?;
+            if let Some(e) = effort {
+                let e = e.trim().to_ascii_lowercase();
+                if e == "default" || e.is_empty() {
+                    p.reasoning_effort = None;
+                } else if crate::config::REASONING_EFFORTS.contains(&e.as_str()) {
+                    p.reasoning_effort = Some(e);
+                } else {
+                    return Err(anyhow!("effort is one of none, low, medium, high, default"));
+                }
+            }
+            for h in headers {
+                match h.split_once(':') {
+                    Some((k, v)) if v.trim().is_empty() => {
+                        p.headers.remove(k.trim());
+                    }
+                    _ => p.headers.extend(ProviderConfig::parse_headers(&h).map_err(|e| anyhow!(e))?),
+                }
+            }
+            if let Some(j) = extra_json {
+                p.extra_body = ProviderConfig::parse_extra_body(&j).map_err(|e| anyhow!("--extra-json {e}"))?;
+            }
+            if let Some(n) = context_window {
+                p.context_window = n;
+            }
+            if let Some(m) = model {
+                p.default_model = m;
+            }
+            if let Some(k) = key {
+                p.api_key = Some(k).filter(|k| !k.is_empty());
+            }
+            if let Some(k) = key_env {
+                p.api_key_env = Some(k).filter(|k| !k.is_empty());
+            }
+            if let Some(t) = tools {
+                p.tools = t;
+            }
+            let summary = format!(
+                "`{id}`: effort {}, {} extra header(s), extra fields {}, tools {}",
+                p.reasoning_effort.as_deref().unwrap_or("default"),
+                p.headers.len(),
+                serde_json::to_string(&p.extra_body).unwrap_or_default(),
+                if p.tools { "on" } else { "off" }
+            );
+            cfg.save_profile(&paths)?;
+            println!("{summary}");
             Ok(())
         }
         Cmd::LabelProvider { id, label } => {
@@ -262,6 +407,27 @@ pub fn run(cli: Cli, paths: Paths) -> Result<()> {
             ProfileCmd::Create { name } => {
                 crate::profiles::create(&paths, &name)?;
                 println!("Created profile “{name}”. Switch with `mercury profile use {name}`.");
+                Ok(())
+            }
+            ProfileCmd::Export { name, out } => {
+                let name = name.unwrap_or_else(|| paths.profile.clone());
+                if !crate::profiles::exists(&paths, &name) {
+                    return Err(anyhow!("no profile `{name}`"));
+                }
+                let out = out.unwrap_or_else(|| crate::portable::default_file_name(&name).into());
+                let n = crate::portable::export(&paths.with_profile(&name), &out)?;
+                println!("Exported “{name}” ({n} files, no API keys) to {}", out.display());
+                Ok(())
+            }
+            ProfileCmd::Import { file, name } => {
+                let r = crate::portable::import(&paths, &file, name.as_deref())?;
+                println!(
+                    "Imported as profile “{}” with {} chats. Open it with `mercury profile use {}`.",
+                    r.profile, r.sessions, r.profile
+                );
+                if !r.providers_added.is_empty() {
+                    println!("Added providers (enter their API keys again): {}", r.providers_added.join(", "));
+                }
                 Ok(())
             }
             ProfileCmd::Delete { name, yes } => {
@@ -409,7 +575,12 @@ pub async fn doctor(paths: &Paths, cfg: &Config) -> String {
         let status = match crate::nous::credentials(paths, p).await {
             Err(e) => format!("credentials: {e}"),
             Ok((base, key)) => {
-                match tokio::time::timeout(Duration::from_secs(8), crate::provider::Client::new(&base, key).list_models()).await {
+                match tokio::time::timeout(
+                    Duration::from_secs(8),
+                    crate::provider::Client::with_options(&base, key, p.client_options(&cfg.agent)).list_models(),
+                )
+                .await
+                {
                     Ok(Ok(m)) => format!("ok, {} models", m.len()),
                     Ok(Err(e)) => format!("error: {}", crate::provider::truncate(&e.to_string(), 160)),
                     Err(_) => "timed out".into(),
@@ -542,7 +713,9 @@ async fn chat(
     resume: Option<String>,
     model: Option<String>,
     yolo: bool,
+    attach: Vec<std::path::PathBuf>,
 ) -> Result<()> {
+    let mut atts = attach.iter().map(|f| crate::attach::load(f).map_err(|e| anyhow!(e))).collect::<Result<Vec<_>>>()?;
     if yolo {
         cfg.approvals = ApprovalMode::Yolo;
     }
@@ -579,8 +752,13 @@ async fn chat(
     }
     let color = std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
     if let Some(q) = query {
-        let _ = render_turn(agent, q, false, color).await;
+        let (text, images) = crate::attach::compose(&q, &atts);
+        agent.pending_images = images;
+        let _ = render_turn(agent, text, false, color).await;
         return Ok(());
+    }
+    if !atts.is_empty() {
+        println!("Attached to your first message: {}", atts.iter().map(|a| a.label()).collect::<Vec<_>>().join(", "));
     }
     let _ = store.prune_empty(&agent.session.id);
     println!(
@@ -624,7 +802,12 @@ async fn chat(
         let skills: Vec<String> = agent.tools.skills.list().into_iter().map(|s| s.name).collect();
         match commands::parse(text, &skills) {
             None => {
-                let msg = if text.starts_with("//") { text[1..].to_string() } else { text.to_string() };
+                let mut msg = if text.starts_with("//") { text[1..].to_string() } else { text.to_string() };
+                if !atts.is_empty() {
+                    let (t, images) = crate::attach::compose(&msg, &std::mem::take(&mut atts));
+                    agent.pending_images = images;
+                    msg = t;
+                }
                 agent = render_turn(agent, msg, true, color).await;
             }
             Some(Command::Help) => println!("{}\n/exit                   quit", commands::help_text()),

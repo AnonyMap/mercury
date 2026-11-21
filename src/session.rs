@@ -19,6 +19,10 @@ pub struct SessionMeta {
     pub model: String,
     pub usage: Usage,
     pub message_count: u64,
+    /// Kept at the top of the list.
+    pub pinned: bool,
+    /// Hidden from the list (still searchable).
+    pub archived: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -153,6 +157,13 @@ impl SessionStore {
             conn.execute_batch("ALTER TABLE sessions ADD COLUMN origin TEXT;")?;
         }
         conn.execute_batch("CREATE UNIQUE INDEX IF NOT EXISTS sessions_origin ON sessions(origin) WHERE origin IS NOT NULL;")?;
+        // v3: pinning and archiving.
+        let cols: Vec<String> = conn.prepare("PRAGMA table_info(sessions)")?.query_map([], |r| r.get::<_, String>(1))?.flatten().collect();
+        for col in ["pinned", "archived"] {
+            if !cols.iter().any(|c| c == col) {
+                conn.execute_batch(&format!("ALTER TABLE sessions ADD COLUMN {col} INTEGER NOT NULL DEFAULT 0;"))?;
+            }
+        }
         Ok(Self { conn: Mutex::new(conn) })
     }
 
@@ -247,7 +258,7 @@ impl SessionStore {
         let c = self.c();
         Ok(c.query_row(
             "SELECT s.id, s.title, s.created_at, s.updated_at, s.provider, s.model, s.prompt_tokens, s.completion_tokens,
-                    (SELECT count(*) FROM messages m WHERE m.session_id = s.id)
+                    (SELECT count(*) FROM messages m WHERE m.session_id = s.id), s.pinned, s.archived
              FROM sessions s WHERE s.id = ?1",
             params![id],
             row_to_meta,
@@ -259,7 +270,7 @@ impl SessionStore {
         let c = self.c();
         let mut st = c.prepare(
             "SELECT s.id, s.title, s.created_at, s.updated_at, s.provider, s.model, s.prompt_tokens, s.completion_tokens,
-                    (SELECT count(*) FROM messages m WHERE m.session_id = s.id)
+                    (SELECT count(*) FROM messages m WHERE m.session_id = s.id), s.pinned, s.archived
              FROM sessions s ORDER BY s.updated_at DESC LIMIT ?1",
         )?;
         let rows = st.query_map(params![limit as i64], row_to_meta)?;
@@ -309,6 +320,41 @@ impl SessionStore {
     pub fn rename(&self, session_id: &str, title: &str) -> Result<()> {
         self.c().execute("UPDATE sessions SET title = ?2 WHERE id = ?1", params![session_id, title.trim()])?;
         Ok(())
+    }
+
+    pub fn set_pinned(&self, session_id: &str, pinned: bool) -> Result<()> {
+        self.c().execute("UPDATE sessions SET pinned = ?2 WHERE id = ?1", params![session_id, pinned as i64])?;
+        Ok(())
+    }
+
+    pub fn set_archived(&self, session_id: &str, archived: bool) -> Result<()> {
+        // Archiving unpins: a pinned chat you can't see would be odd.
+        self.c().execute("UPDATE sessions SET archived = ?2, pinned = 0 WHERE id = ?1", params![session_id, archived as i64])?;
+        Ok(())
+    }
+
+    /// The most recently active chat that has messages and isn't archived (for "resume last chat").
+    pub fn latest(&self) -> Result<Option<SessionMeta>> {
+        Ok(self.list(50)?.into_iter().find(|s| s.message_count > 0 && !s.archived))
+    }
+
+    /// Recent user messages across chats, newest first (composer history, ↑ key).
+    pub fn recent_user_messages(&self, limit: usize) -> Result<Vec<String>> {
+        let c = self.c();
+        let mut st = c.prepare("SELECT json_extract(body, '$.content') FROM messages WHERE role = 'user' ORDER BY id DESC LIMIT ?1")?;
+        let rows = st.query_map(params![(limit * 2) as i64], |r| r.get::<_, Option<String>>(0))?;
+        let mut out: Vec<String> = vec![];
+        for t in rows.flatten().flatten() {
+            // Skip injected text (summaries, continue prompts) and duplicates.
+            if t.starts_with("[Summary of our earlier conversation]") || out.contains(&t) {
+                continue;
+            }
+            out.push(t);
+            if out.len() >= limit {
+                break;
+            }
+        }
+        Ok(out)
     }
 
     pub fn set_model(&self, session_id: &str, provider: &str, model: &str) -> Result<()> {
@@ -373,6 +419,8 @@ fn row_to_meta(r: &rusqlite::Row<'_>) -> rusqlite::Result<SessionMeta> {
         model: r.get(5)?,
         usage: Usage { prompt_tokens: p as u64, completion_tokens: c as u64, total_tokens: (p + c) as u64 },
         message_count: r.get::<_, i64>(8)? as u64,
+        pinned: r.get::<_, i64>(9)? != 0,
+        archived: r.get::<_, i64>(10)? != 0,
     })
 }
 
