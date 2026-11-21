@@ -2,6 +2,7 @@
 
 pub mod browse;
 pub mod chat;
+pub mod palette;
 mod settings;
 pub mod theme;
 
@@ -17,13 +18,13 @@ use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::{Agent, AgentEvent, CommandOutcome};
+use crate::attach::Attachment;
 use crate::commands::{self, Command};
 use crate::config::{Config, Paths, ProviderKind};
 use crate::discovery::Discovered;
 use crate::nous::DeviceCode;
-use crate::provider::{Message, Role, Usage};
+use crate::provider::{Message, ModelInfo, Role, Usage};
 use crate::session::{SearchHit, SessionMeta, SessionStore};
-use crate::skills::SkillLibrary;
 use chat::ChatItem;
 
 #[allow(clippy::large_enum_variant)]
@@ -47,8 +48,16 @@ pub enum UiMsg {
     Config(Config),
     Models {
         provider: String,
-        result: Result<Vec<String>, String>,
+        result: Result<Vec<ModelInfo>, String>,
     },
+    /// "Test connection" finished for a provider.
+    Probe {
+        provider: String,
+        ok: bool,
+        summary: String,
+    },
+    /// Profiles were added or exported; refresh the list and show this.
+    ProfilesChanged(Result<String, String>),
     Discovered(Vec<Discovered>),
     NousCode(DeviceCode),
     NousDone(Result<String, String>),
@@ -80,6 +89,8 @@ pub struct ProviderDraft {
     pub name: String,
     pub url: String,
     pub key: String,
+    /// Variable to read the key from when none is typed (set by presets).
+    pub key_env: String,
     pub model: String,
 }
 
@@ -170,6 +181,47 @@ pub struct MercuryApp {
     pub hermes_target: String,
     pub hermes_mode: crate::config::LinkMode,
     hermes_scanned: bool,
+    /// Files attached to the message being written.
+    pub attachments: Vec<Attachment>,
+    /// Unsent text per chat, so switching chats doesn't lose a half-written message.
+    pub drafts: HashMap<String, String>,
+    /// Earlier messages for ↑/↓ in an empty composer, newest first.
+    pub history: Vec<String>,
+    history_pos: Option<usize>,
+    pub palette: Option<palette::Palette>,
+    pub find: Option<FindBar>,
+    pub show_archived: bool,
+    /// (tokens used by the last request, context window).
+    pub context: (u64, u32),
+    /// Tokens per second of the last reply.
+    pub speed: Option<f32>,
+    first_token: Option<Instant>,
+    streamed_chars: usize,
+    speed_measured: bool,
+    /// Metadata from model lists, keyed `provider/model`.
+    pub model_meta: HashMap<String, ModelInfo>,
+    /// Last "Test connection" result per provider: (ok, summary).
+    pub probes: HashMap<String, (bool, String)>,
+    pub probing: std::collections::HashSet<String>,
+    /// Text being edited for a provider's headers / extra JSON, with a parse error if any.
+    pub provider_text: HashMap<String, ProviderText>,
+    logs_dir: PathBuf,
+}
+
+#[derive(Default, Clone)]
+pub struct FindBar {
+    pub query: String,
+    pub current: usize,
+    /// Scroll to the current match on the next frame.
+    pub scroll: bool,
+    focused: bool,
+}
+
+#[derive(Default, Clone)]
+pub struct ProviderText {
+    pub headers: String,
+    pub extra: String,
+    pub error: Option<String>,
 }
 
 fn send(tx: &Sender<UiMsg>, repaint: &Arc<Mutex<Option<egui::Context>>>, m: UiMsg) {
@@ -183,7 +235,8 @@ impl MercuryApp {
     pub fn new(paths: Paths, config: Config, rt: Arc<tokio::runtime::Runtime>) -> anyhow::Result<Self> {
         paths.ensure()?;
         let store = Arc::new(SessionStore::open(&paths.sessions_db())?);
-        let agent = Agent::with_store(paths.clone(), config.clone(), store.clone(), None)?;
+        let resume = if config.ui.resume_last { store.latest().ok().flatten().map(|s| s.id) } else { None };
+        let agent = Agent::with_store(paths.clone(), config.clone(), store.clone(), resume.as_deref())?;
         let _ = store.prune_empty(&agent.session.id);
         let session = agent.session.clone();
         let workdir = agent.workdir();
@@ -247,9 +300,34 @@ impl MercuryApp {
             hermes_target: String::new(),
             hermes_mode: crate::config::LinkMode::Copy,
             hermes_scanned: false,
+            attachments: vec![],
+            drafts: HashMap::new(),
+            history: vec![],
+            history_pos: None,
+            palette: None,
+            find: None,
+            show_archived: false,
+            context: (0, 0),
+            speed: None,
+            first_token: None,
+            streamed_chars: 0,
+            speed_measured: false,
+            model_meta: HashMap::new(),
+            probes: HashMap::new(),
+            probing: Default::default(),
+            provider_text: HashMap::new(),
+            logs_dir: PathBuf::new(),
         };
+        app.logs_dir = app.paths.data_dir.join("logs");
+        if let Some(report) = crate::crashlog::take_previous_crash(&app.logs_dir) {
+            app.toast(format!("Mercury closed unexpectedly last time. The report is in {}", report.display()));
+        }
+        app.history = app.store.recent_user_messages(100).unwrap_or_default();
         app.profiles = crate::profiles::list(&app.paths);
         app.refresh_sessions();
+        if resume.is_some() {
+            app.reload_transcript();
+        }
         if let Some(p) = app.config.active().map(|p| p.id.clone()) {
             app.fetch_models(&p);
         }
@@ -258,6 +336,28 @@ impl MercuryApp {
 
     fn spawn<F: std::future::Future<Output = ()> + Send + 'static>(&self, f: F) {
         self.rt.spawn(f);
+    }
+
+    /// Run agent work so that a panic inside it is reported and the UI leaves its busy state,
+    /// instead of the turn hanging forever.
+    pub fn spawn_guarded<F: std::future::Future<Output = ()> + Send + 'static>(&self, f: F) {
+        use futures_util::FutureExt;
+        let (tx, rp) = self.sender();
+        let logs = self.logs_dir.clone();
+        self.rt.spawn(async move {
+            if let Err(p) = std::panic::AssertUnwindSafe(f).catch_unwind().await {
+                let report = crate::crashlog::file_recovered(&logs).map(|p| format!(" Details: {}", p.display())).unwrap_or_default();
+                send(
+                    &tx,
+                    &rp,
+                    UiMsg::Agent(AgentEvent::Error(format!(
+                        "Something went wrong inside Mercury ({}). The chat is saved; you can keep going.{report}",
+                        crate::crashlog::panic_message(&*p)
+                    ))),
+                );
+                send(&tx, &rp, UiMsg::Busy(false));
+            }
+        });
     }
 
     fn sender(&self) -> (Sender<UiMsg>, Arc<Mutex<Option<egui::Context>>>) {
@@ -287,11 +387,7 @@ impl MercuryApp {
     }
 
     pub fn skill_names(&self) -> Vec<String> {
-        SkillLibrary::new(self.config.skills_dir(&self.paths), self.config.extra_skill_dirs.clone())
-            .list()
-            .into_iter()
-            .map(|s| s.name)
-            .collect()
+        self.config.skill_library(&self.paths).list().into_iter().map(|s| s.name).collect()
     }
 
     /// Drain background messages. Public so tests can pump the UI state without rendering.
@@ -336,13 +432,27 @@ impl MercuryApp {
             }
             UiMsg::Models { provider, result } => match result {
                 Ok(list) => {
-                    self.models.insert(provider, list);
+                    for m in &list {
+                        self.model_meta.insert(format!("{provider}/{}", m.id), m.clone());
+                    }
+                    self.models.insert(provider, list.into_iter().map(|m| m.id).collect());
                 }
                 Err(e) => {
                     self.models.remove(&provider);
                     self.toast(format!("Couldn't list models: {e}"));
                 }
             },
+            UiMsg::Probe { provider, ok, summary } => {
+                self.probing.remove(&provider);
+                self.probes.insert(provider, (ok, summary));
+            }
+            UiMsg::ProfilesChanged(r) => {
+                self.refresh_profiles();
+                match r {
+                    Ok(m) => self.toast(m),
+                    Err(e) => self.toast(format!("Couldn't do that: {e}")),
+                }
+            }
             UiMsg::Discovered(list) => {
                 self.discovering = false;
                 if list.is_empty() {
@@ -385,9 +495,21 @@ impl MercuryApp {
 
     fn handle_event(&mut self, ev: AgentEvent) {
         match ev {
-            AgentEvent::TurnStarted | AgentEvent::ToolCallStreaming { .. } => {}
-            AgentEvent::TextDelta(t) => chat::push_delta(&mut self.items, &t, false),
-            AgentEvent::ReasoningDelta(t) => chat::push_delta(&mut self.items, &t, true),
+            AgentEvent::TurnStarted => {
+                self.first_token = None;
+                self.streamed_chars = 0;
+                self.speed_measured = false;
+            }
+            AgentEvent::ToolCallStreaming { .. } => {}
+            AgentEvent::TextDelta(t) => {
+                self.note_tokens(&t);
+                chat::push_delta(&mut self.items, &t, false)
+            }
+            AgentEvent::ReasoningDelta(t) => {
+                self.note_tokens(&t);
+                chat::push_delta(&mut self.items, &t, true)
+            }
+            AgentEvent::Context { used, window } => self.context = (used, window),
             AgentEvent::ToolRunning { id, name, summary, args } => {
                 self.items.push(ChatItem::Tool { id, name, summary, args, output: None, is_error: false });
             }
@@ -409,10 +531,31 @@ impl MercuryApp {
                 }
             }
             AgentEvent::TranscriptReplaced => self.reload_transcript(),
-            AgentEvent::Usage(u) => self.usage = u,
+            AgentEvent::Usage(u) => {
+                // Speed from the server's own count when it gives one.
+                if let Some(t0) = self.first_token.take() {
+                    let secs = t0.elapsed().as_secs_f32();
+                    let gained = u.completion_tokens.saturating_sub(self.usage.completion_tokens);
+                    if secs > 0.2 && gained > 0 {
+                        self.speed = Some(gained as f32 / secs);
+                        self.speed_measured = true;
+                    }
+                }
+                self.streamed_chars = 0;
+                self.usage = u;
+            }
             AgentEvent::Notice(t) => self.items.push(ChatItem::Notice(t)),
             AgentEvent::Error(t) => self.items.push(ChatItem::Error(t)),
             AgentEvent::TurnFinished => {
+                if !self.speed_measured
+                    && let Some(t0) = self.first_token.take()
+                {
+                    // The server didn't report usage: estimate (~4 characters per token).
+                    let secs = t0.elapsed().as_secs_f32();
+                    if secs > 0.2 && self.streamed_chars > 0 {
+                        self.speed = Some(self.streamed_chars as f32 / 4.0 / secs);
+                    }
+                }
                 // Close any bubble left streaming by an interrupted turn.
                 for i in &mut self.items {
                     if let ChatItem::Assistant { streaming, .. } = i {
@@ -421,6 +564,13 @@ impl MercuryApp {
                 }
             }
         }
+    }
+
+    fn note_tokens(&mut self, t: &str) {
+        if self.first_token.is_none() {
+            self.first_token = Some(Instant::now());
+        }
+        self.streamed_chars += t.len();
     }
 
     fn transcript_msg(a: &Agent) -> UiMsg {
@@ -440,15 +590,22 @@ impl MercuryApp {
 
     pub fn submit(&mut self) {
         let text = self.input.trim().to_string();
-        if text.is_empty() || self.busy {
+        if (text.is_empty() && self.attachments.is_empty()) || self.busy {
             return;
         }
         self.input.clear();
+        self.drafts.remove(&self.session.id);
+        self.history_pos = None;
+        if !text.is_empty() && self.history.first() != Some(&text) {
+            self.history.insert(0, text.clone());
+            self.history.truncate(200);
+        }
         match commands::parse(&text, &self.skill_names()) {
             None => {
                 // `//text` escapes a leading slash.
                 let msg = if text.starts_with("//") { text[1..].to_string() } else { text };
-                self.start_turn(msg)
+                let (msg, images) = crate::attach::compose(&msg, &std::mem::take(&mut self.attachments));
+                self.start_turn_with(msg, images)
             }
             Some(Command::Stop) => self.stop(),
             Some(Command::Help) => self.items.push(ChatItem::Info(commands::help_text())),
@@ -457,14 +614,19 @@ impl MercuryApp {
     }
 
     pub fn start_turn(&mut self, text: String) {
-        self.items.push(ChatItem::User(text.clone()));
+        self.start_turn_with(text, vec![]);
+    }
+
+    pub fn start_turn_with(&mut self, text: String, images: Vec<String>) {
+        self.items.push(ChatItem::User(chat::user_label(&text, images.len())));
         self.begin_busy();
         let cancel = self.cancel.clone().unwrap_or_default();
         let agent = self.agent.clone();
         let ev = self.event_bridge();
         let (tx, rp) = self.sender();
-        self.spawn(async move {
+        self.spawn_guarded(async move {
             let mut a = agent.lock().await;
+            a.pending_images = images;
             a.run_turn(&text, &ev, &cancel).await;
             send(&tx, &rp, UiMsg::Config(a.config.clone()));
             send(&tx, &rp, UiMsg::Busy(false));
@@ -482,7 +644,7 @@ impl MercuryApp {
         let agent = self.agent.clone();
         let ev = self.event_bridge();
         let (tx, rp) = self.sender();
-        self.spawn(async move {
+        self.spawn_guarded(async move {
             let mut a = agent.lock().await;
             match a.handle_command(cmd, &ev, &cancel).await {
                 Ok(CommandOutcome::Text(t)) => send(&tx, &rp, UiMsg::Info(t)),
@@ -628,8 +790,11 @@ impl MercuryApp {
             let config = Config::load_profile(&paths)?;
             crate::profiles::set_active(&paths, name)?;
             let store = Arc::new(SessionStore::open(&paths.sessions_db())?);
-            let agent = Agent::with_store(paths.clone(), config.clone(), store.clone(), None)?;
+            let resume = if config.ui.resume_last { store.latest().ok().flatten().map(|s| s.id) } else { None };
+            let agent = Agent::with_store(paths.clone(), config.clone(), store.clone(), resume.as_deref())?;
             let _ = store.prune_empty(&agent.session.id);
+            self.items = chat::from_messages(&agent.messages);
+            self.usage = agent.usage.clone();
             self.session = agent.session.clone();
             self.workdir = agent.workdir();
             self.workdir_draft = self.workdir.display().to_string();
@@ -644,8 +809,14 @@ impl MercuryApp {
             return;
         }
         self.config_dirty = false;
-        self.items.clear();
-        self.usage = Usage::default();
+        self.provider_text.clear();
+        self.probes.clear();
+        self.input.clear();
+        self.attachments.clear();
+        self.find = None;
+        self.context = (0, 0);
+        self.history = self.store.recent_user_messages(100).unwrap_or_default();
+        self.history_pos = None;
         self.search.clear();
         self.search_hits.clear();
         self.memory_draft = None;
@@ -690,6 +861,7 @@ impl MercuryApp {
             browse::PickPurpose::HermesFolder => self.hermes_path.clone(),
             browse::PickPurpose::Logo => self.logo_path_draft.clone(),
             browse::PickPurpose::Workdir => self.workdir_draft.clone(),
+            _ => String::new(),
         }
     }
 
@@ -722,6 +894,16 @@ impl MercuryApp {
                 self.workdir_draft = path.display().to_string();
                 self.set_workdir(self.workdir_draft.clone());
             }
+            browse::PickPurpose::Attachment => {
+                self.view = View::Chat;
+                self.attach_files(vec![path]);
+            }
+            browse::PickPurpose::ExportDir(i) => {
+                if let Some(name) = self.profiles.get(i).cloned() {
+                    self.export_profile(&name, path);
+                }
+            }
+            browse::PickPurpose::ProfileArchive => self.import_profile(path),
         }
     }
 
@@ -771,7 +953,25 @@ impl MercuryApp {
             return;
         }
         self.view = View::Chat;
+        self.stash_draft(None);
         self.run_command(Command::New);
+    }
+
+    /// Keep the unsent message (and attachments are dropped) when leaving this chat; restore the
+    /// one saved for `next`, if any.
+    fn stash_draft(&mut self, next: Option<&str>) {
+        let text = std::mem::take(&mut self.input);
+        if text.trim().is_empty() {
+            self.drafts.remove(&self.session.id);
+        } else {
+            self.drafts.insert(self.session.id.clone(), text);
+        }
+        self.attachments.clear();
+        self.history_pos = None;
+        self.find = None;
+        if let Some(n) = next {
+            self.input = self.drafts.get(n).cloned().unwrap_or_default();
+        }
     }
 
     pub fn open_session(&mut self, id: String) {
@@ -780,6 +980,7 @@ impl MercuryApp {
             return;
         }
         self.view = View::Chat;
+        self.stash_draft(Some(&id));
         let agent = self.agent.clone();
         let (tx, rp) = self.sender();
         self.spawn(async move {
@@ -789,6 +990,230 @@ impl MercuryApp {
                 Err(e) => send(&tx, &rp, UiMsg::Toast(format!("{e:#}"))),
             }
         });
+    }
+
+    pub fn set_pinned(&mut self, id: &str, pinned: bool) {
+        let _ = self.store.set_pinned(id, pinned);
+        self.refresh_sessions();
+    }
+
+    pub fn set_archived(&mut self, id: &str, archived: bool) {
+        let _ = self.store.set_archived(id, archived);
+        if archived && id == self.session.id {
+            self.new_chat();
+        }
+        self.refresh_sessions();
+    }
+
+    pub fn attach_files(&mut self, files: Vec<PathBuf>) {
+        for f in files {
+            match crate::attach::load(&f) {
+                Ok(a) => {
+                    if a.is_image() && !self.model_sees_images() {
+                        self.toast(format!(
+                            "{} attached. The current model isn't marked as vision-capable; it may ignore or reject images.",
+                            a.name
+                        ));
+                    }
+                    self.attachments.push(a);
+                }
+                Err(e) => self.toast(e),
+            }
+        }
+    }
+
+    /// Whether the selected model is known to take images (unknown counts as yes).
+    fn model_sees_images(&self) -> bool {
+        let (Some(p), Some(m)) = (self.config.active(), self.config.active_model_name()) else { return true };
+        match self.model_meta.get(&format!("{}/{m}", p.id)) {
+            Some(info) if !info.tags.is_empty() => info.vision(),
+            _ => true,
+        }
+    }
+
+    pub fn test_provider(&mut self, id: &str) {
+        let Some(p) = self.config.provider(id).cloned() else { return };
+        self.probing.insert(id.to_string());
+        let (paths, cfg) = (self.paths.clone(), self.config.clone());
+        let (tx, rp) = self.sender();
+        let id = id.to_string();
+        self.spawn(async move {
+            let r = crate::probe::test_provider(&paths, &cfg, &p, None).await;
+            send(&tx, &rp, UiMsg::Probe { provider: id, ok: r.ok(), summary: r.summary() });
+        });
+    }
+
+    /// Set the active provider's `reasoning_effort` ("" = server default).
+    pub fn set_effort(&mut self, effort: &str) {
+        let Some(id) = self.config.active().map(|p| p.id.clone()) else { return };
+        if let Some(p) = self.config.providers.iter_mut().find(|p| p.id == id) {
+            p.reasoning_effort = Some(effort.to_string()).filter(|e| !e.is_empty());
+        }
+        self.apply_config();
+    }
+
+    pub fn toggle_favorite(&mut self, provider: &str, model: &str) {
+        let key = format!("{provider}/{model}");
+        let favs = &mut self.config.ui.favorite_models;
+        if let Some(i) = favs.iter().position(|f| *f == key) {
+            favs.remove(i);
+        } else {
+            favs.push(key);
+        }
+        let _ = self.config.save_profile(&self.paths);
+    }
+
+    pub fn export_profile(&mut self, name: &str, dir: PathBuf) {
+        let src = self.paths.with_profile(name);
+        let out = dir.join(crate::portable::default_file_name(name));
+        let (tx, rp) = self.sender();
+        let name = name.to_string();
+        self.spawn(async move {
+            let r = tokio::task::spawn_blocking(move || {
+                crate::portable::export(&src, &out)
+                    .map(|n| format!("Exported “{name}” ({n} files, API keys left out) to {}", out.display()))
+                    .map_err(|e| format!("{e:#}"))
+            })
+            .await
+            .unwrap_or_else(|e| Err(e.to_string()));
+            send(&tx, &rp, UiMsg::ProfilesChanged(r));
+        });
+    }
+
+    pub fn import_profile(&mut self, archive: PathBuf) {
+        let paths = self.paths.clone();
+        let (tx, rp) = self.sender();
+        self.spawn(async move {
+            let r = tokio::task::spawn_blocking(move || {
+                crate::portable::import(&paths, &archive, None)
+                    .map(|r| {
+                        let mut m = format!("Added profile “{}” with {} chats.", r.profile, r.sessions);
+                        if !r.providers_added.is_empty() {
+                            m.push_str(&format!(" New providers (enter their keys): {}.", r.providers_added.join(", ")));
+                        }
+                        m
+                    })
+                    .map_err(|e| format!("{e:#}"))
+            })
+            .await
+            .unwrap_or_else(|e| Err(e.to_string()));
+            send(&tx, &rp, UiMsg::ProfilesChanged(r));
+        });
+    }
+
+    pub fn open_palette(&mut self) {
+        let mut items = vec![
+            palette::Item::new("New chat", "Ctrl+N", palette::Action::NewChat),
+            palette::Item::new("Find in this chat", "Ctrl+F", palette::Action::Find),
+            palette::Item::new("Attach files…", "images, text, code", palette::Action::Attach),
+            palette::Item::new("Toggle the chats sidebar", "Ctrl+B", palette::Action::ToggleSidebar),
+            palette::Item::new("Toggle light / dark", "", palette::Action::ToggleTheme),
+        ];
+        for (tab, name) in settings::TABS {
+            items.push(palette::Item::new(format!("Settings: {name}"), "Ctrl+,", palette::Action::Settings(*tab)));
+        }
+        for (c, d) in commands::HELP {
+            let name = c.split([',', ' ']).next().unwrap_or(c);
+            items.push(palette::Item::new(name, *d, palette::Action::Slash(name.to_string())));
+        }
+        for p in &self.config.providers {
+            items.push(palette::Item::new(
+                format!("Test connection: {}", p.name),
+                &p.base_url,
+                palette::Action::TestProvider(p.id.clone()),
+            ));
+            let favs = &self.config.ui.favorite_models;
+            let mut models = self.models.get(&p.id).cloned().unwrap_or_default();
+            models.sort_by_key(|m| !favs.contains(&format!("{}/{m}", p.id)));
+            for m in models.into_iter().take(300) {
+                items.push(palette::Item::new(format!("Model: {m}"), &p.name, palette::Action::Model { provider: p.id.clone(), model: m }));
+            }
+        }
+        for name in &self.profiles {
+            if *name != self.paths.profile {
+                items.push(palette::Item::new(format!("Profile: {name}"), "switch", palette::Action::Profile(name.clone())));
+            }
+        }
+        for s in &self.sessions {
+            let title = if s.title.is_empty() { "New chat" } else { &s.title };
+            let when = s.updated_at.with_timezone(&chrono::Local).format("%b %e").to_string();
+            items.push(palette::Item::new(format!("Chat: {title}"), when, palette::Action::OpenSession(s.id.clone())));
+        }
+        self.palette = Some(palette::Palette::new(items));
+    }
+
+    pub fn run_palette(&mut self, action: palette::Action) {
+        use palette::Action::*;
+        self.palette = None;
+        match action {
+            NewChat => self.new_chat(),
+            OpenSession(id) => self.open_session(id),
+            Slash(cmd) => {
+                let takes_arg =
+                    commands::HELP.iter().any(|(c, _)| c.starts_with(&cmd) && (c.contains('[') || c.contains(" text") || c.contains(" n")));
+                self.view = View::Chat;
+                if takes_arg || self.busy {
+                    self.input = format!("{cmd} ");
+                } else {
+                    self.input = cmd;
+                    self.submit();
+                }
+            }
+            Settings(tab) => self.view = View::Settings(tab),
+            Model { provider, model } => {
+                if self.config.active().map(|p| p.id.as_str()) != Some(provider.as_str()) {
+                    self.config.set_active(&provider, Some(model));
+                    self.apply_config();
+                    self.fetch_models(&provider);
+                } else {
+                    self.select_model(&model);
+                }
+            }
+            Profile(name) => self.switch_profile(&name, false),
+            ToggleSidebar => self.toggle_sidebar(),
+            ToggleTheme => {
+                self.config.ui.dark = !self.config.ui.dark;
+                let _ = self.config.save_profile(&self.paths);
+            }
+            Find => self.open_find(),
+            Attach => self.browse(browse::PickPurpose::Attachment),
+            TestProvider(id) => {
+                self.view = View::Settings(Tab::Providers);
+                self.test_provider(&id);
+            }
+        }
+    }
+
+    pub fn toggle_sidebar(&mut self) {
+        self.config.ui.show_sidebar = !self.config.ui.show_sidebar;
+        let _ = self.config.save_profile(&self.paths);
+    }
+
+    pub fn open_find(&mut self) {
+        self.view = View::Chat;
+        if self.find.is_none() {
+            self.find = Some(FindBar::default());
+        } else if let Some(f) = &mut self.find {
+            f.focused = false;
+        }
+    }
+
+    /// ↑/↓ in the composer: step through earlier messages while the box is empty or showing one.
+    pub fn history_step(&mut self, older: bool) -> bool {
+        let showing_history = self.history_pos.is_some_and(|i| self.history.get(i) == Some(&self.input));
+        if !(self.input.is_empty() || showing_history) || self.history.is_empty() {
+            return false;
+        }
+        let next = match (self.history_pos.filter(|_| showing_history), older) {
+            (None, true) => Some(0),
+            (None, false) => return false,
+            (Some(i), true) => Some((i + 1).min(self.history.len() - 1)),
+            (Some(0), false) => None,
+            (Some(i), false) => Some(i - 1),
+        };
+        self.history_pos = next;
+        self.input = next.and_then(|i| self.history.get(i).cloned()).unwrap_or_default();
+        true
     }
 
     pub fn delete_session(&mut self, id: String) {
@@ -837,12 +1262,14 @@ impl MercuryApp {
     pub fn fetch_models(&self, provider_id: &str) {
         let Some(p) = self.config.provider(provider_id).cloned() else { return };
         let paths = self.paths.clone();
+        let cfg = self.config.clone();
         let (tx, rp) = self.sender();
         let id = provider_id.to_string();
         self.spawn(async move {
             let result = async {
                 let (base, key) = crate::nous::credentials(&paths, &p).await.map_err(|e| format!("{e:#}"))?;
-                crate::provider::Client::new(&base, key).list_models().await.map_err(|e| e.to_string())
+                let opts = p.client_options(&cfg.agent);
+                crate::provider::Client::with_options(&base, key, opts).list_model_info().await.map_err(|e| e.to_string())
             }
             .await;
             send(&tx, &rp, UiMsg::Models { provider: id, result });
@@ -886,6 +1313,12 @@ impl MercuryApp {
         let id = crate::config::unique_provider_id(&self.config, &name);
         let mut p = crate::config::ProviderConfig::openai(&id, &name, &url);
         p.api_key = Some(d.key.trim().to_string()).filter(|k| !k.is_empty());
+        if p.api_key.is_none() {
+            p.api_key_env = Some(d.key_env.trim().to_string()).filter(|k| !k.is_empty());
+        }
+        if let Some(pre) = crate::config::presets().into_iter().find(|pr| pr.base_url == url) {
+            p.headers = pre.headers;
+        }
         p.default_model = d.model.trim().to_string();
         let first = self.config.providers.is_empty();
         self.config.upsert_provider(p);
@@ -1000,12 +1433,17 @@ impl MercuryApp {
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::Icon(Some(Arc::new(egui::IconData { rgba, width: 64, height: 64 }))));
             self.icon_applied = Some(icon_key);
         }
-        // Drop an image file on the window while Settings > General is open to use it as the logo.
-        if self.view == View::Settings(Tab::General)
-            && let Some(path) =
-                ui.ctx().input(|i| i.raw.dropped_files.first().map(|f| f.path().to_path_buf()).filter(|p| !p.as_os_str().is_empty()))
-        {
-            self.set_custom_logo(&path);
+        // Dropped files: on Settings > General an image becomes the logo; anywhere else they're
+        // attached to the message being written.
+        let dropped: Vec<PathBuf> =
+            ui.ctx().input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).filter(|p| !p.as_os_str().is_empty()).collect());
+        if !dropped.is_empty() {
+            if self.view == View::Settings(Tab::General) {
+                self.set_custom_logo(&dropped[0]);
+            } else {
+                self.view = View::Chat;
+                self.attach_files(dropped);
+            }
         }
         self.poll();
         self.shortcuts(ui);
@@ -1017,12 +1455,14 @@ impl MercuryApp {
         egui::Panel::bottom("statusbar")
             .frame(egui::Frame::new().fill(p.surface).inner_margin(egui::Margin::symmetric(12, 4)))
             .show(ui, |ui| self.status_bar(ui));
-        egui::Panel::left("sidebar")
-            .resizable(true)
-            .default_size(250.0)
-            .min_size(180.0)
-            .frame(egui::Frame::new().fill(p.surface).inner_margin(egui::Margin::same(10)))
-            .show(ui, |ui| self.sidebar(ui));
+        if self.config.ui.show_sidebar {
+            egui::Panel::left("sidebar")
+                .resizable(true)
+                .default_size(250.0)
+                .min_size(180.0)
+                .frame(egui::Frame::new().fill(p.surface).inner_margin(egui::Margin::same(10)))
+                .show(ui, |ui| self.sidebar(ui));
+        }
         egui::CentralPanel::default().frame(egui::Frame::new().fill(p.bg).inner_margin(egui::Margin::symmetric(18, 12))).show(ui, |ui| {
             match self.view {
                 View::Settings(tab) => settings::show(self, ui, tab),
@@ -1031,10 +1471,54 @@ impl MercuryApp {
             }
         });
         self.draw_browser(ui);
+        self.draw_palette(ui);
         self.draw_toasts(ui);
     }
 
+    fn draw_palette(&mut self, ui: &mut Ui) {
+        let Some(pal) = self.palette.as_mut() else { return };
+        let p = theme::palette(self.config.ui.dark);
+        let mut outcome = palette::Outcome::None;
+        let mut open = true;
+        egui::Window::new("Command palette")
+            .id(egui::Id::unique("command_palette"))
+            .open(&mut open)
+            .title_bar(false)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(620.0)
+            .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 70.0))
+            .show(ui.ctx(), |ui| outcome = pal.show(ui, p.muted, p.accent));
+        match outcome {
+            palette::Outcome::Run(a) => self.run_palette(a),
+            palette::Outcome::Close => self.palette = None,
+            palette::Outcome::None if !open => self.palette = None,
+            palette::Outcome::None => {}
+        }
+    }
+
     fn shortcuts(&mut self, ui: &mut Ui) {
+        let (palette, sidebar, find) = ui.input_mut(|i| {
+            (
+                i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::K))
+                    || i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::P)),
+                i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::B)),
+                i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::F)),
+            )
+        });
+        if palette {
+            if self.palette.is_some() {
+                self.palette = None;
+            } else {
+                self.open_palette();
+            }
+        }
+        if sidebar {
+            self.toggle_sidebar();
+        }
+        if find {
+            self.open_find();
+        }
         let (new, settings, esc, bigger, smaller, reset, wheel) = ui.input_mut(|i| {
             (
                 i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::N)),
@@ -1067,8 +1551,12 @@ impl MercuryApp {
         if settings {
             self.view = if matches!(self.view, View::Settings(_)) { View::Chat } else { View::Settings(Tab::Providers) };
         }
-        if esc && self.busy {
-            self.stop();
+        if esc && self.palette.is_none() {
+            if self.find.is_some() {
+                self.find = None;
+            } else if self.busy {
+                self.stop();
+            }
         }
     }
 
@@ -1079,8 +1567,12 @@ impl MercuryApp {
 
     fn top_bar(&mut self, ui: &mut Ui) {
         // At large text sizes the pickers move to a second row instead of overlapping the controls.
-        let compact = ui.available_width() < 1030.0;
+        let compact = ui.available_width() < 1130.0;
         ui.horizontal(|ui| {
+            let hint = if self.config.ui.show_sidebar { "Hide the chats sidebar (Ctrl+B)" } else { "Show the chats sidebar (Ctrl+B)" };
+            if ui.small_button("☰").on_hover_text(hint).clicked() {
+                self.toggle_sidebar();
+            }
             self.logo(ui, 28.0);
             ui.label(RichText::new("Mercury").strong().size(17.0));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -1099,6 +1591,9 @@ impl MercuryApp {
         let settings_open = matches!(self.view, View::Settings(_));
         if ui.selectable_label(settings_open, "⚙ Settings").clicked() {
             self.view = if settings_open { View::Chat } else { View::Settings(Tab::Providers) };
+        }
+        if ui.small_button("Commands").on_hover_text("Command palette (Ctrl+K): chats, commands, models, settings").clicked() {
+            self.open_palette();
         }
         // Text size: always one click away.
         if ui.small_button("A+").on_hover_text("Larger text (Ctrl +)").clicked() {
@@ -1160,8 +1655,12 @@ impl MercuryApp {
         }
         // Model picker
         let current = self.config.active_model_name().unwrap_or_else(|| "Choose a model".into());
-        let list = self.models.get(&active_id).cloned().unwrap_or_default();
+        let mut list = self.models.get(&active_id).cloned().unwrap_or_default();
+        let favs = self.config.ui.favorite_models.clone();
+        let is_fav = |m: &str| favs.iter().any(|f| *f == format!("{active_id}/{m}"));
+        list.sort_by_key(|m| !is_fav(m));
         let mut chosen_model = None;
+        let mut star = None;
         let picker = egui::ComboBox::from_id_salt("model_picker")
             .selected_text(crate::provider::truncate(&current, 40))
             .width(model_w)
@@ -1172,14 +1671,56 @@ impl MercuryApp {
                     ui.label(RichText::new("No model list yet — refresh, or type a name in Settings.").small().color(p.muted));
                 }
                 for m in &list {
-                    if ui.selectable_label(*m == current, m).clicked() {
-                        chosen_model = Some(m.clone());
-                    }
+                    ui.horizontal(|ui| {
+                        let fav = is_fav(m);
+                        let s =
+                            ui.small_button(if fav { "★" } else { "☆" }).on_hover_text(if fav { "Unstar" } else { "Star: list it first" });
+                        a11y_label(&s, &format!("{} {m}", if fav { "Unstar" } else { "Star" }));
+                        if s.clicked() {
+                            star = Some(m.clone());
+                        }
+                        let mut label = m.clone();
+                        if let Some(info) = self.model_meta.get(&format!("{active_id}/{m}")) {
+                            if let Some(n) = info.context_length {
+                                label.push_str(&format!("  · {}k", n / 1000));
+                            }
+                            if info.vision() {
+                                label.push_str("  · vision");
+                            }
+                        }
+                        if ui.selectable_label(*m == current, label).clicked() {
+                            chosen_model = Some(m.clone());
+                        }
+                    });
                 }
             });
         a11y_label(&picker.response, "Model");
+        if let Some(m) = star {
+            self.toggle_favorite(&active_id, &m);
+        }
         if let Some(m) = chosen_model {
             self.select_model(&m);
+        }
+        // Reasoning effort for models that think (sent as `reasoning_effort`).
+        let effort = self.config.active().and_then(|p| p.reasoning_effort.clone()).unwrap_or_default();
+        let mut new_effort = None;
+        let r = egui::ComboBox::from_id_salt("effort_picker")
+            .selected_text(if effort.is_empty() { "effort: auto".to_string() } else { format!("effort: {effort}") })
+            .width(112.0)
+            .show_ui(ui, |ui| {
+                if ui.selectable_label(effort.is_empty(), "auto (server default)").clicked() {
+                    new_effort = Some(String::new());
+                }
+                for e in crate::config::REASONING_EFFORTS {
+                    if ui.selectable_label(effort == *e, *e).clicked() {
+                        new_effort = Some(e.to_string());
+                    }
+                }
+            });
+        a11y_label(&r.response, "Reasoning effort");
+        r.response.on_hover_text("How hard reasoning models think (reasoning_effort). Models that don't reason ignore it.");
+        if let Some(e) = new_effort {
+            self.set_effort(&e);
         }
         if ui.small_button("⟳").on_hover_text("Refresh the model list").clicked() {
             self.fetch_models(&active_id);
@@ -1200,10 +1741,32 @@ impl MercuryApp {
                 ui.label(RichText::new(label).small().color(color));
                 ui.separator();
             }
-            ui.label(RichText::new(format!("{} tokens this session", self.usage.total_tokens)).small().color(p.muted));
-            if self.config.approvals == crate::config::ApprovalMode::Yolo {
+            let (used, window) = self.context;
+            if window > 0 && used > 0 {
+                let pct = used as f32 / window as f32;
+                let color = if pct > 0.8 { p.warn } else { p.muted };
+                ui.label(RichText::new(format!("context {} / {} ({:.0}%)", short_num(used), short_num(window as u64), pct * 100.0)).small().color(color))
+                    .on_hover_text("How full the model's context window is after the last reply. Mercury summarises older turns when it gets full; /compress does it now.");
                 ui.separator();
-                ui.label(RichText::new("YOLO: commands run without approval").small().color(p.warn));
+            }
+            ui.label(RichText::new(format!("{} tokens this session", short_num(self.usage.total_tokens))).small().color(p.muted));
+            if self.config.ui.show_speed
+                && let Some(sp) = self.speed
+            {
+                ui.separator();
+                ui.label(RichText::new(format!("{sp:.0} tok/s")).small().color(p.muted)).on_hover_text("Speed of the last reply");
+            }
+            ui.separator();
+            use crate::config::ApprovalMode;
+            let (text, color, hint) = match self.config.approvals {
+                ApprovalMode::Yolo => ("YOLO: commands run without approval", p.warn, "Click to ask before dangerous commands again"),
+                ApprovalMode::Ask => ("approvals: ask", p.muted, "Click for YOLO: run dangerous commands without asking"),
+                ApprovalMode::Deny => ("approvals: deny", p.muted, "Dangerous commands are refused. Click for YOLO"),
+            };
+            let r = ui.add(egui::Button::new(RichText::new(text).small().color(color)).frame(false)).on_hover_text(hint);
+            if r.clicked() {
+                self.config.approvals = if self.config.approvals == ApprovalMode::Yolo { ApprovalMode::Ask } else { ApprovalMode::Yolo };
+                self.apply_config();
             }
         });
     }
@@ -1262,6 +1825,8 @@ impl MercuryApp {
         ui.add_space(6.0);
         let mut open = None;
         let mut delete = None;
+        let mut pin = None;
+        let mut archive = None;
         egui::ScrollArea::vertical().id_salt("sessions").auto_shrink(false).show(ui, |ui| {
             if !self.search.trim().is_empty() {
                 if self.search_hits.is_empty() {
@@ -1279,13 +1844,20 @@ impl MercuryApp {
             }
             let today = chrono::Local::now().date_naive();
             let mut last_group = String::new();
-            for s in &self.sessions {
+            let archived_count = self.sessions.iter().filter(|s| s.archived).count();
+            let mut shown: Vec<&SessionMeta> = self.sessions.iter().filter(|s| s.archived == self.show_archived).collect();
+            shown.sort_by_key(|s| !s.pinned);
+            for s in shown {
                 let d = s.updated_at.with_timezone(&chrono::Local).date_naive();
-                let group = match (today - d).num_days() {
-                    0 => "Today".to_string(),
-                    1 => "Yesterday".to_string(),
-                    2..=7 => "This week".to_string(),
-                    _ => d.format("%B %Y").to_string(),
+                let group = if s.pinned {
+                    "Pinned".to_string()
+                } else {
+                    match (today - d).num_days() {
+                        0 => "Today".to_string(),
+                        1 => "Yesterday".to_string(),
+                        2..=7 => "This week".to_string(),
+                        _ => d.format("%B %Y").to_string(),
+                    }
                 };
                 if group != last_group {
                     ui.add_space(4.0);
@@ -1320,15 +1892,36 @@ impl MercuryApp {
                         self.renaming = Some((s.id.clone(), title.clone()));
                         ui.close();
                     }
+                    if ui.button(if s.pinned { "Unpin" } else { "Pin to top" }).clicked() {
+                        pin = Some((s.id.clone(), !s.pinned));
+                        ui.close();
+                    }
+                    if ui.button(if s.archived { "Unarchive" } else { "Archive" }).clicked() {
+                        archive = Some((s.id.clone(), !s.archived));
+                        ui.close();
+                    }
                     if ui.button("Delete").clicked() {
                         delete = Some(s.id.clone());
                         ui.close();
                     }
                 });
             }
+            if archived_count > 0 || self.show_archived {
+                ui.add_space(8.0);
+                let label = if self.show_archived { "Back to chats".to_string() } else { format!("Archived ({archived_count})") };
+                if ui.add(egui::Button::new(RichText::new(label).small().color(p.muted)).frame(false)).clicked() {
+                    self.show_archived = !self.show_archived;
+                }
+            }
         });
         if let Some(id) = open {
             self.open_session(id);
+        }
+        if let Some((id, on)) = pin {
+            self.set_pinned(&id, on);
+        }
+        if let Some((id, on)) = archive {
+            self.set_archived(&id, on);
         }
         if let Some(id) = delete {
             self.delete_session(id);
@@ -1424,6 +2017,11 @@ impl MercuryApp {
         egui::Panel::bottom("composer")
             .frame(egui::Frame::new().fill(p.bg).inner_margin(egui::Margin { left: 0, right: 0, top: 8, bottom: 0 }))
             .show(ui, |ui| self.composer(ui));
+        if self.find.is_some() {
+            egui::Panel::top("find_bar")
+                .frame(egui::Frame::new().fill(p.bg).inner_margin(egui::Margin { left: 0, right: 0, top: 0, bottom: 6 }))
+                .show(ui, |ui| self.find_bar(ui));
+        }
         egui::CentralPanel::default().frame(egui::Frame::new()).show(ui, |ui| {
             if self.items.is_empty() {
                 ui.vertical_centered(|ui| {
@@ -1444,9 +2042,59 @@ impl MercuryApp {
             }
             egui::ScrollArea::vertical().id_salt("chat_scroll").stick_to_bottom(true).auto_shrink(false).show(ui, |ui| {
                 ui.set_max_width(ui.available_width().min(980.0));
-                chat::render(ui, &self.items, p, &mut self.md_cache, self.config.ui.show_reasoning);
+                let matches = self.find.as_ref().map(|f| chat::find_matches(&self.items, &f.query)).unwrap_or_default();
+                let hl = match &mut self.find {
+                    Some(f) if !matches.is_empty() => {
+                        f.current = f.current.min(matches.len() - 1);
+                        let scroll = std::mem::take(&mut f.scroll);
+                        chat::Highlight { matches: &matches, current: Some(matches[f.current]), scroll }
+                    }
+                    _ => chat::Highlight::default(),
+                };
+                chat::render(ui, &self.items, p, &mut self.md_cache, self.config.ui.show_reasoning, &hl);
             });
         });
+    }
+
+    fn find_bar(&mut self, ui: &mut Ui) {
+        let p = theme::palette(self.config.ui.dark);
+        let n = self.find.as_ref().map(|f| chat::find_matches(&self.items, &f.query).len()).unwrap_or(0);
+        let Some(f) = self.find.as_mut() else { return };
+        let mut close = false;
+        ui.horizontal(|ui| {
+            let r = ui.add(egui::TextEdit::singleline(&mut f.query).hint_text("Find in this chat").desired_width(260.0));
+            a11y_label(&r, "Find in chat");
+            if !f.focused {
+                r.request_focus();
+                f.focused = true;
+            }
+            if r.changed() {
+                f.current = 0;
+                f.scroll = true;
+            }
+            let enter = r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+            let shift = ui.input(|i| i.modifiers.shift);
+            if n > 0 {
+                ui.label(RichText::new(format!("{} of {n}", f.current.min(n - 1) + 1)).small().color(p.muted));
+            } else if !f.query.trim().is_empty() {
+                ui.label(RichText::new("no matches").small().color(p.muted));
+            }
+            if (ui.small_button("Previous").clicked() || (enter && shift)) && n > 0 {
+                f.current = (f.current + n - 1) % n;
+                f.scroll = true;
+                r.request_focus();
+            } else if (ui.small_button("Next").clicked() || enter) && n > 0 {
+                f.current = (f.current + 1) % n;
+                f.scroll = true;
+                r.request_focus();
+            }
+            if ui.small_button("Close").on_hover_text("Esc").clicked() {
+                close = true;
+            }
+        });
+        if close {
+            self.find = None;
+        }
     }
 
     fn composer(&mut self, ui: &mut Ui) {
@@ -1536,6 +2184,33 @@ impl MercuryApp {
                 self.input = t;
             }
         }
+        if !self.attachments.is_empty() {
+            let mut remove = None;
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new("Attached:").small().color(p.muted));
+                for (i, a) in self.attachments.iter().enumerate() {
+                    egui::Frame::new()
+                        .fill(p.surface)
+                        .stroke(egui::Stroke::new(1.0, p.border))
+                        .corner_radius(8)
+                        .inner_margin(egui::Margin::symmetric(8, 2))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new(a.label()).small());
+                                let x = ui.small_button("x").on_hover_text("Remove");
+                                a11y_label(&x, &format!("Remove {}", a.name));
+                                if x.clicked() {
+                                    remove = Some(i);
+                                }
+                            });
+                        });
+                }
+            });
+            if let Some(i) = remove {
+                self.attachments.remove(i);
+            }
+            ui.add_space(4.0);
+        }
         egui::Frame::new()
             .fill(p.surface)
             .stroke(egui::Stroke::new(1.0, p.border))
@@ -1543,9 +2218,28 @@ impl MercuryApp {
             .inner_margin(egui::Margin::same(8))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
+                    let attach = ui
+                        .small_button("+")
+                        .on_hover_text("Attach files (or drop them on the window): images for vision models, text and code inline");
+                    a11y_label(&attach, "Attach files");
+                    if attach.clicked() {
+                        self.browse(browse::PickPurpose::Attachment);
+                    }
                     let btn_w = 84.0;
+                    // ↑/↓ recall earlier messages while the box is empty (or showing one).
+                    let focused = ui.memory(|m| m.focused()) == Some(egui::Id::unique("chat_input"));
+                    if focused && !self.busy {
+                        let (up, down) = ui.input(|i| (i.key_pressed(Key::ArrowUp), i.key_pressed(Key::ArrowDown)));
+                        let stepped = (up && self.history_step(true)) || (down && self.history_step(false));
+                        if stepped {
+                            ui.input_mut(|i| {
+                                i.consume_key(Modifiers::NONE, Key::ArrowUp);
+                                i.consume_key(Modifiers::NONE, Key::ArrowDown);
+                            });
+                        }
+                    }
                     let edit = egui::TextEdit::multiline(&mut self.input)
-                        .id_salt("chat_input")
+                        .id(egui::Id::unique("chat_input"))
                         .hint_text("Message Mercury  ·  Enter to send, Shift+Enter for a new line, / for commands")
                         .desired_rows(2)
                         .desired_width(ui.available_width() - btn_w - 8.0)
@@ -1558,7 +2252,7 @@ impl MercuryApp {
                             self.stop();
                         }
                     } else {
-                        let can = !self.input.trim().is_empty();
+                        let can = !self.input.trim().is_empty() || !self.attachments.is_empty();
                         if ui
                             .add_enabled(can, egui::Button::new(RichText::new("Send").strong()).min_size(egui::vec2(btn_w, 34.0)))
                             .clicked()
@@ -1631,9 +2325,22 @@ impl eframe::App for MercuryApp {
     }
 }
 
-pub fn run(paths: Paths, config: Config) -> anyhow::Result<()> {
+/// 1234 → "1.2k", 128000 → "128k".
+pub fn short_num(n: u64) -> String {
+    match n {
+        0..=999 => n.to_string(),
+        1_000..=9_999 => format!("{:.1}k", n as f64 / 1000.0),
+        10_000..=999_999 => format!("{}k", n / 1000),
+        _ => format!("{:.1}M", n as f64 / 1_000_000.0),
+    }
+}
+
+pub fn run(paths: Paths, config: Config, warnings: Vec<String>) -> anyhow::Result<()> {
     let rt = Arc::new(tokio::runtime::Builder::new_multi_thread().enable_all().worker_threads(4).build()?);
-    let app = MercuryApp::new(paths, config.clone(), rt)?;
+    let mut app = MercuryApp::new(paths, config.clone(), rt)?;
+    for w in warnings {
+        app.toast(w);
+    }
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Mercury")

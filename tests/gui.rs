@@ -532,3 +532,291 @@ fn deleting_a_profile_asks_first() {
     h.run_steps(2);
     assert_eq!(h.state().profiles, vec!["default"]);
 }
+
+// ---- v0.4 ------------------------------------------------------------------------------------
+
+#[test]
+fn command_palette_reaches_settings_models_and_chats() {
+    let rt = rt();
+    let mock = rt.block_on(start());
+    *mock.state.models.lock().unwrap() = vec!["test-model".into(), "deepseek-v4".into()];
+    let (_d, app) = app_with_mock(&rt, &mock.base());
+    let mut h = harness(app);
+    wait(&mut h, "model list", |a| a.models.get("mock").is_some_and(|m| m.len() == 2));
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::K);
+    h.run_steps(3);
+    assert!(h.state().palette.is_some());
+    h.get_by_label("Command palette search").type_text("tools safety");
+    h.run_steps(2);
+    h.key_press(egui::Key::Enter);
+    h.run_steps(3);
+    assert_eq!(h.state().view, View::Settings(Tab::Tools));
+    assert!(h.state().palette.is_none());
+
+    h.get_by_label("Commands").click_accesskit();
+    h.run_steps(3);
+    h.get_by_label("Command palette search").type_text("deepseek");
+    h.run_steps(2);
+    h.key_press(egui::Key::Enter);
+    h.run_steps(3);
+    assert_eq!(h.state().config.active_model_name().as_deref(), Some("deepseek-v4"));
+
+    // Esc closes it without doing anything.
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::P);
+    h.run_steps(2);
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    assert!(h.state().palette.is_none());
+}
+
+#[test]
+fn sidebar_toggle_find_and_history() {
+    let rt = rt();
+    let mock = rt.block_on(start());
+    mock.push_chat(text("Pelicans are large water birds."));
+    mock.push_chat(text("Yes, pelicans can fly."));
+    let (_d, mut app) = app_with_mock(&rt, &mock.base());
+    app.input = "Tell me about pelicans".into();
+    let mut h = harness(app);
+    h.run_steps(3);
+    h.get_by_label("Send").click();
+    wait(&mut h, "first reply", |a| !a.busy && a.items.len() >= 2);
+    h.state_mut().input = "Can they fly?".into();
+    h.run_steps(1);
+    h.get_by_label("Send").click();
+    wait(&mut h, "second reply", |a| !a.busy && a.items.len() >= 4);
+
+    // Ctrl+B hides and shows the chats sidebar (persisted).
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::B);
+    h.run_steps(3);
+    assert!(!h.state().config.ui.show_sidebar);
+    assert!(h.query_by_label("+  New chat").is_none());
+    h.get_by_label("☰").click_accesskit();
+    h.run_steps(3);
+    h.get_by_label("+  New chat");
+
+    // Ctrl+F finds across the conversation.
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::F);
+    h.run_steps(3);
+    h.get_by_label("Find in chat").type_text("pelican");
+    h.run_steps(3);
+    h.get_by_label("1 of 3");
+    h.get_by_label("Next").click_accesskit();
+    h.run_steps(2);
+    h.get_by_label("2 of 3");
+    h.get_by_label("Previous").click_accesskit();
+    h.run_steps(1);
+    h.get_by_label("Previous").click_accesskit();
+    h.run_steps(2);
+    h.get_by_label("3 of 3");
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    assert!(h.state().find.is_none());
+
+    // ↑ in the empty composer brings back earlier messages, newest first; ↓ goes back.
+    assert!(h.state_mut().history_step(true));
+    assert_eq!(h.state().input, "Can they fly?");
+    assert!(h.state_mut().history_step(true));
+    assert_eq!(h.state().input, "Tell me about pelicans");
+    assert!(h.state_mut().history_step(false));
+    assert!(h.state_mut().history_step(false));
+    assert_eq!(h.state().input, "");
+    h.state_mut().input = "half-typed".into();
+    assert!(!h.state_mut().history_step(true), "doesn't overwrite what you're typing");
+}
+
+#[test]
+fn drafts_survive_switching_chats_and_the_last_chat_reopens() {
+    let rt = rt();
+    let mock = rt.block_on(start());
+    mock.push_chat(text("First chat answer."));
+    let (d, mut app) = app_with_mock(&rt, &mock.base());
+    let paths = app.paths.clone();
+    let cfg = app.config.clone();
+    app.input = "first question".into();
+    let mut h = harness(app);
+    h.run_steps(3);
+    h.get_by_label("Send").click();
+    wait(&mut h, "reply", |a| !a.busy && a.items.len() >= 2);
+    let first = h.state().session.id.clone();
+    h.state_mut().input = "a draft I haven't sent".into();
+    h.state_mut().new_chat();
+    wait(&mut h, "new chat", |a| a.session.id != first && !a.busy);
+    assert!(h.state().input.is_empty());
+    h.state_mut().open_session(first.clone());
+    wait(&mut h, "back in the first chat", |a| a.session.id == first);
+    assert_eq!(h.state().input, "a draft I haven't sent");
+
+    // A new window opens on the last chat.
+    let again = MercuryApp::new(paths, cfg, rt.clone()).unwrap();
+    let mut h2 = harness(again);
+    wait(&mut h2, "transcript", |a| a.items.len() >= 2);
+    assert_eq!(h2.state().session.id, first);
+    h2.get_by_label_contains("First chat answer.");
+    drop(d);
+}
+
+#[test]
+fn attachments_reach_the_model() {
+    let rt = rt();
+    let mock = rt.block_on(start());
+    mock.push_chat(text("I see a small orange square and your notes."));
+    let (d, mut app) = app_with_mock(&rt, &mock.base());
+    let img = d.path().join("square.png");
+    image::RgbImage::from_pixel(8, 8, image::Rgb([255, 120, 0])).save(&img).unwrap();
+    let notes = d.path().join("notes.md");
+    std::fs::write(&notes, "- buy milk\n").unwrap();
+    std::fs::write(d.path().join("data.bin"), [0u8, 159, 146, 150]).unwrap();
+    app.attach_files(vec![img, notes, d.path().join("data.bin")]);
+    assert_eq!(app.attachments.len(), 2, "the binary file is refused");
+    app.input = "What's in these?".into();
+    let mut h = harness(app);
+    h.run_steps(3);
+    h.get_by_label("Remove square.png");
+    h.get_by_label("Remove notes.md");
+    h.get_by_label("Send").click();
+    wait(&mut h, "reply", |a| !a.busy && a.items.len() >= 2);
+    assert!(h.state().attachments.is_empty());
+    let body = mock.requests().last().cloned().unwrap();
+    let user = body["messages"].as_array().unwrap().iter().rfind(|m| m["role"] == "user").unwrap().clone();
+    let text_part = user["content"][0]["text"].as_str().unwrap();
+    assert!(text_part.starts_with("What's in these?") && text_part.contains("[Attached file: notes.md]") && text_part.contains("buy milk"));
+    assert!(user["content"][1]["image_url"]["url"].as_str().unwrap().starts_with("data:image/jpeg;base64,"));
+    h.get_by_label_contains("[1 image attached]");
+}
+
+#[test]
+fn pin_archive_and_status_bar() {
+    let rt = rt();
+    let mock = rt.block_on(start());
+    mock.push_chat(text("one"));
+    let (_d, mut app) = app_with_mock(&rt, &mock.base());
+    app.input = "Alpha topic".into();
+    let mut h = harness(app);
+    h.run_steps(3);
+    h.get_by_label("Send").click();
+    wait(&mut h, "reply", |a| !a.busy && a.items.len() >= 2);
+    // Context meter and speed come from the reply's usage.
+    h.get_by_label_contains("context 15 / 32k");
+    let id = h.state().session.id.clone();
+    h.state_mut().set_pinned(&id, true);
+    h.run_steps(3);
+    h.get_by_label("Pinned");
+    h.state_mut().set_archived(&id, true);
+    wait(&mut h, "fresh chat after archiving the open one", |a| a.session.id != id && !a.busy);
+    h.get_by_label("Archived (1)").click_accesskit();
+    h.run_steps(3);
+    assert!(h.state().show_archived);
+    h.get_by_label("Alpha topic");
+    let meta = h.state().sessions.iter().find(|s| s.id == id).cloned().unwrap();
+    assert!(meta.archived && !meta.pinned, "archiving unpins");
+}
+
+#[test]
+fn effort_picker_and_connection_test() {
+    let rt = rt();
+    let mock = rt.block_on(start());
+    mock.push_chat(text("OK"));
+    let (_d, app) = app_with_mock(&rt, &mock.base());
+    let paths = app.paths.clone();
+    let mut h = harness(app);
+    h.run_steps(3);
+    h.get_by_label("Reasoning effort").click_accesskit();
+    h.run_steps(2);
+    h.get_by_label("low").click_accesskit();
+    h.run_steps(3);
+    assert_eq!(h.state().config.active().unwrap().reasoning_effort.as_deref(), Some("low"));
+    assert_eq!(Config::load(&paths.config_file()).unwrap().provider("mock").unwrap().reasoning_effort.as_deref(), Some("low"));
+
+    h.state_mut().view = View::Settings(Tab::Providers);
+    h.run_steps(3);
+    h.get_by_label("Test connection").click_accesskit();
+    wait(&mut h, "probe result", |a| a.probes.contains_key("mock"));
+    h.get_by_label_contains("OK: 2 chat models listed");
+    assert_eq!(mock.requests().last().unwrap()["reasoning_effort"], "low", "the test uses the provider's options");
+
+    // Extra request fields: bad JSON shows an error and isn't applied; good JSON is.
+    h.get_by_label("Provider extra request fields").scroll_to_me();
+    h.run_steps(2);
+    h.get_by_label("Provider extra request fields").focus();
+    h.run_steps(1);
+    h.get_by_label("Provider extra request fields").type_text("{oops");
+    h.run_steps(2);
+    h.get_by_label_contains("not valid JSON");
+    assert!(h.state().config.provider("mock").unwrap().extra_body.is_empty());
+    h.state_mut().provider_text.get_mut("mock").unwrap().extra = String::new();
+    h.run_steps(1);
+    h.get_by_label("Provider extra request fields").focus();
+    h.run_steps(1);
+    h.get_by_label("Provider extra request fields").type_text(r#"{"service_tier":"flex"}"#);
+    h.run_steps(2);
+    assert_eq!(h.state().config.provider("mock").unwrap().extra_body["service_tier"], "flex");
+}
+
+#[test]
+fn skills_can_be_switched_off() {
+    let rt = rt();
+    let (_d, mut app) = app_with_mock(&rt, "http://127.0.0.1:9/v1");
+    let dir = app.config.skills_dir(&app.paths).join("deploy-site");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("SKILL.md"), "---\nname: deploy-site\ndescription: Deploy the site\n---\nSteps.").unwrap();
+    app.view = View::Settings(Tab::Skills);
+    let mut h = harness(app);
+    h.run_steps(3);
+    assert_eq!(h.state().skill_names(), vec!["deploy-site"]);
+    h.get_by_label("Enable skill deploy-site").click_accesskit();
+    h.run_steps(3);
+    assert_eq!(h.state().config.disabled_skills, vec!["deploy-site"]);
+    assert!(h.state().skill_names().is_empty(), "not runnable as /deploy-site");
+    let saved = Config::load_profile(&h.state().paths).unwrap();
+    assert_eq!(saved.disabled_skills, vec!["deploy-site"]);
+    h.get_by_label("Enable skill deploy-site").click_accesskit();
+    h.run_steps(3);
+    assert!(h.state().config.disabled_skills.is_empty());
+}
+
+#[test]
+fn profiles_export_and_import_from_the_app() {
+    let rt = rt();
+    let (d, mut app) = app_with_mock(&rt, "http://127.0.0.1:9/v1");
+    mercury::profiles::create(&app.paths, "work").unwrap();
+    app.refresh_profiles();
+    let out = d.path().join("exports");
+    std::fs::create_dir_all(&out).unwrap();
+    app.view = View::Settings(Tab::Hermes);
+    let mut h = harness(app);
+    h.run_steps(3);
+    h.get_by_label("Export work");
+    h.state_mut().export_profile("work", out.clone());
+    wait(&mut h, "exported", |_| std::fs::read_dir(&out).map(|r| r.count() == 1).unwrap_or(false));
+    let file = std::fs::read_dir(&out).unwrap().next().unwrap().unwrap().path();
+    assert!(file.to_string_lossy().ends_with(".tar.gz"));
+    h.state_mut().import_profile(file);
+    wait(&mut h, "imported", |a| a.profiles.contains(&"work-2".to_string()));
+    h.get_by_label("Open work-2");
+}
+
+#[test]
+fn a_panic_in_agent_work_is_reported_not_hung() {
+    let rt = rt();
+    let (_d, mut app) = app_with_mock(&rt, "http://127.0.0.1:9/v1");
+    app.busy = true;
+    app.spawn_guarded(async { panic!("boom in a background task") });
+    let mut h = harness(app);
+    wait(&mut h, "recovered", |a| !a.busy);
+    h.get_by_label_contains("Something went wrong inside Mercury (boom in a background task)");
+}
+
+#[test]
+fn yolo_toggle_in_the_status_bar() {
+    let rt = rt();
+    let (_d, app) = app_with_mock(&rt, "http://127.0.0.1:9/v1");
+    let mut h = harness(app);
+    h.run_steps(3);
+    h.get_by_label("approvals: ask").click_accesskit();
+    h.run_steps(3);
+    assert_eq!(h.state().config.approvals, ApprovalMode::Yolo);
+    h.get_by_label("YOLO: commands run without approval").click_accesskit();
+    h.run_steps(3);
+    assert_eq!(h.state().config.approvals, ApprovalMode::Ask);
+}

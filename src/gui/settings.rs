@@ -20,6 +20,16 @@ use crate::memory::{MemoryStore, Target};
 use crate::session::SessionStore;
 use crate::skills::SkillLibrary;
 
+pub const TABS: &[(Tab, &str)] = &[
+    (Tab::Providers, "Models & providers"),
+    (Tab::Nous, "Nous Portal"),
+    (Tab::Tools, "Tools & safety"),
+    (Tab::Memory, "Memory"),
+    (Tab::Skills, "Skills"),
+    (Tab::Hermes, "Profiles & Hermes"),
+    (Tab::General, "General"),
+];
+
 pub fn show(app: &mut MercuryApp, ui: &mut Ui, tab: Tab) {
     let p = theme::palette(app.config.ui.dark);
     ui.horizontal(|ui| {
@@ -32,17 +42,9 @@ pub fn show(app: &mut MercuryApp, ui: &mut Ui, tab: Tab) {
     });
     // Tabs wrap onto a second line on narrow windows or large text sizes.
     ui.horizontal_wrapped(|ui| {
-        for (t, label) in [
-            (Tab::Providers, "Models & providers"),
-            (Tab::Nous, "Nous Portal"),
-            (Tab::Tools, "Tools & safety"),
-            (Tab::Memory, "Memory"),
-            (Tab::Skills, "Skills"),
-            (Tab::Hermes, "Profiles & Hermes"),
-            (Tab::General, "General"),
-        ] {
-            if ui.selectable_label(tab == t, label).clicked() {
-                app.view = View::Settings(t);
+        for (t, label) in TABS {
+            if ui.selectable_label(tab == *t, *label).clicked() {
+                app.view = View::Settings(*t);
             }
         }
     });
@@ -102,8 +104,11 @@ fn providers(app: &mut MercuryApp, ui: &mut Ui, p: &theme::Palette) {
     let mut remove = None;
     let mut use_it = None;
     let mut refresh = None;
+    let mut test = None;
     let mut dirty = false;
     for prov in app.config.providers.iter_mut() {
+        let probing = app.probing.contains(&prov.id);
+        let probe = app.probes.get(&prov.id).cloned();
         egui::Frame::new()
             .fill(p.surface)
             .stroke(egui::Stroke::new(1.0, if prov.id == active { p.accent } else { p.border }))
@@ -126,11 +131,20 @@ fn providers(app: &mut MercuryApp, ui: &mut Ui, p: &theme::Palette) {
                         if ui.small_button("List models").clicked() {
                             refresh = Some(prov.id.clone());
                         }
+                        if ui.add_enabled(!probing, egui::Button::new("Test connection").small()).clicked() {
+                            test = Some(prov.id.clone());
+                        }
+                        if probing {
+                            ui.spinner();
+                        }
                         if prov.id != active && ui.small_button("Use").clicked() {
                             use_it = Some(prov.id.clone());
                         }
                     });
                 });
+                if let Some((ok, summary)) = &probe {
+                    ui.add(egui::Label::new(RichText::new(summary).small().color(if *ok { p.ok } else { p.danger })).wrap());
+                }
                 egui::Grid::new(("prov_grid", &prov.id)).num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
                     ui.label("Label");
                     dirty |= ui
@@ -176,13 +190,68 @@ fn providers(app: &mut MercuryApp, ui: &mut Ui, p: &theme::Palette) {
                     dirty |= ui
                         .add(egui::DragValue::new(&mut prov.context_window).range(0..=2_000_000).speed(512))
                         .labelled("Context window")
-                        .on_hover_text("0 = use the default in General")
+                        .on_hover_text("0 = what the server reports for the model (DeepInfra, OpenRouter, LM Studio, llama.cpp), else the default in Tools & safety")
                         .changed();
                     ui.end_row();
                     ui.label("Tool calling");
                     dirty |= ui.checkbox(&mut prov.tools, "send tools (turn off for models that can't call functions)").changed();
                     ui.end_row();
+                    ui.label("Reasoning effort");
+                    let cur = prov.reasoning_effort.clone().unwrap_or_default();
+                    let r = egui::ComboBox::from_id_salt(("effort", &prov.id))
+                        .selected_text(if cur.is_empty() { "auto (server default)" } else { cur.as_str() })
+                        .show_ui(ui, |ui| {
+                            if ui.selectable_label(cur.is_empty(), "auto (server default)").clicked() {
+                                prov.reasoning_effort = None;
+                                dirty = true;
+                            }
+                            for e in crate::config::REASONING_EFFORTS {
+                                if ui.selectable_label(cur == *e, *e).clicked() {
+                                    prov.reasoning_effort = Some(e.to_string());
+                                    dirty = true;
+                                }
+                            }
+                        });
+                    super::a11y_label(&r.response, "Provider reasoning effort");
+                    ui.end_row();
+                    let text = app.provider_text.entry(prov.id.clone()).or_insert_with(|| super::ProviderText {
+                        headers: prov.headers.iter().map(|(k, v)| format!("{k}: {v}")).collect::<Vec<_>>().join("\n"),
+                        extra: if prov.extra_body.is_empty() { String::new() } else { serde_json::to_string_pretty(&prov.extra_body).unwrap_or_default() },
+                        error: None,
+                    });
+                    ui.label("Extra headers");
+                    let h = ui
+                        .add(egui::TextEdit::multiline(&mut text.headers).desired_rows(1).hint_text("Name: value, one per line").desired_width(420.0))
+                        .labelled("Provider extra headers");
+                    ui.end_row();
+                    ui.label("Extra request fields");
+                    let x = ui
+                        .add(
+                            egui::TextEdit::multiline(&mut text.extra)
+                                .code_editor()
+                                .desired_rows(1)
+                                .hint_text("JSON, e.g. {\"service_tier\": \"flex\"}")
+                                .desired_width(420.0),
+                        )
+                        .labelled("Provider extra request fields")
+                        .on_hover_text("Merged into every chat request: DeepInfra's service_tier, top_k, min_p, a gateway's routing options…");
+                    ui.end_row();
+                    if h.changed() || x.changed() {
+                        match (crate::config::ProviderConfig::parse_headers(&text.headers), crate::config::ProviderConfig::parse_extra_body(&text.extra)) {
+                            (Ok(hs), Ok(xs)) => {
+                                prov.headers = hs;
+                                prov.extra_body = xs;
+                                text.error = None;
+                                dirty = true;
+                            }
+                            (Err(e), _) => text.error = Some(format!("Headers: {e}")),
+                            (_, Err(e)) => text.error = Some(format!("Extra request fields: {e}")),
+                        }
+                    }
                 });
+                if let Some(e) = app.provider_text.get(&prov.id).and_then(|t| t.error.clone()) {
+                    ui.label(RichText::new(e).small().color(p.danger));
+                }
             });
         ui.add_space(6.0);
     }
@@ -200,6 +269,12 @@ fn providers(app: &mut MercuryApp, ui: &mut Ui, p: &theme::Palette) {
         app.fetch_models(&id);
         app.toast("Fetching models…");
     }
+    if let Some(id) = test {
+        if app.config_dirty {
+            app.apply_config();
+        }
+        app.test_provider(&id);
+    }
 
     section(
         ui,
@@ -210,9 +285,11 @@ fn providers(app: &mut MercuryApp, ui: &mut Ui, p: &theme::Palette) {
     ui.horizontal(|ui| {
         let r = egui::ComboBox::from_id_salt("presets").selected_text("Presets").show_ui(ui, |ui| {
             for pr in crate::config::presets() {
-                if ui.selectable_label(false, &pr.name).clicked() {
+                let hint = pr.api_key_env.as_deref().map(|e| format!("  · key from ${e} or below")).unwrap_or_default();
+                if ui.selectable_label(false, format!("{}{hint}", pr.name)).clicked() {
                     app.draft.name = pr.name.clone();
                     app.draft.url = pr.base_url.clone();
+                    app.draft.key_env = pr.api_key_env.clone().unwrap_or_default();
                 }
             }
         });
@@ -226,7 +303,9 @@ fn providers(app: &mut MercuryApp, ui: &mut Ui, p: &theme::Palette) {
         ui.add(egui::TextEdit::singleline(&mut app.draft.url).hint_text("http://192.168.1.20:11434/v1").desired_width(420.0));
         ui.end_row();
         ui.label("API key");
-        ui.add(egui::TextEdit::singleline(&mut app.draft.key).password(true).hint_text("optional").desired_width(420.0));
+        let hint =
+            if app.draft.key_env.is_empty() { "optional".to_string() } else { format!("or leave empty to use ${}", app.draft.key_env) };
+        ui.add(egui::TextEdit::singleline(&mut app.draft.key).password(true).hint_text(hint).desired_width(420.0));
         ui.end_row();
         ui.label("Model");
         ui.add(egui::TextEdit::singleline(&mut app.draft.model).hint_text("optional — pick later").desired_width(420.0));
@@ -352,6 +431,25 @@ fn tools(app: &mut MercuryApp, ui: &mut Ui, p: &theme::Palette) {
     ui.horizontal(|ui| {
         ui.label("Command timeout (s)");
         dirty |= ui.add(egui::DragValue::new(&mut t.terminal_timeout_secs).range(5..=3600)).labelled("Command timeout").changed();
+    });
+
+    section(
+        ui,
+        p,
+        "Connection",
+        "Busy or rate-limited servers (DeepInfra and others answer 429 when overloaded) are retried with back-off before a reply starts. A reply that stops arriving is cut off after the stall timeout; what arrived is kept.",
+    );
+    ui.horizontal(|ui| {
+        ui.label("Retries");
+        dirty |= ui.add(egui::DragValue::new(&mut app.config.agent.retries).range(0..=10)).labelled("Retries").changed();
+        ui.label("Stall timeout (s)");
+        dirty |=
+            ui.add(egui::DragValue::new(&mut app.config.agent.stall_timeout_secs).range(10..=3600)).labelled("Stall timeout").changed();
+        ui.label("Default context window");
+        dirty |= ui
+            .add(egui::DragValue::new(&mut app.config.agent.default_context_window).range(2048..=2_000_000).speed(1024))
+            .labelled("Default context window")
+            .changed();
     });
 
     section(ui, p, "Dangerous commands", "Things like rm -r, sudo, curl | sh, git push --force, disk writes.");
@@ -495,7 +593,8 @@ fn memory(app: &mut MercuryApp, ui: &mut Ui, p: &theme::Palette) {
 }
 
 fn skills(app: &mut MercuryApp, ui: &mut Ui, p: &theme::Palette) {
-    let lib = SkillLibrary::new(app.paths.default_skills_dir(), app.config.extra_skill_dirs.clone());
+    // Unfiltered, so switched-off skills can still be viewed and switched back on.
+    let lib = SkillLibrary::new(app.config.skills_dir(&app.paths), app.config.extra_skill_dirs.clone());
     section(
         ui,
         p,
@@ -508,17 +607,29 @@ fn skills(app: &mut MercuryApp, ui: &mut Ui, p: &theme::Palette) {
             let _ = open::that_detached(&lib.home);
         }
     });
-    let list = lib.list();
+    let list = lib.list_all();
     if list.is_empty() {
         ui.label(RichText::new("No skills yet. The agent saves them as it learns, or import Hermes's skills from General.").color(p.muted));
         return;
     }
     let mut delete = None;
+    let mut toggled = None;
+    ui.label(RichText::new("Switched-off skills aren't offered to the model or runnable with /<name>.").small().color(p.muted));
     ui.columns(2, |cols| {
         egui::ScrollArea::vertical().id_salt("skill_list").max_height(480.0).show(&mut cols[0], |ui| {
             for s in &list {
                 let sel = app.selected_skill.as_deref() == Some(s.name.as_str());
-                let r = ui.selectable_label(sel, RichText::new(&s.name).strong());
+                let mut on = !app.config.disabled_skills.contains(&s.name);
+                let r = ui
+                    .horizontal(|ui| {
+                        let c = ui.checkbox(&mut on, "");
+                        super::a11y_label(&c, &format!("Enable skill {}", s.name));
+                        if c.changed() {
+                            toggled = Some((s.name.clone(), on));
+                        }
+                        ui.selectable_label(sel, RichText::new(&s.name).strong())
+                    })
+                    .inner;
                 ui.label(RichText::new(&s.description).small().color(p.muted));
                 if !s.writable {
                     ui.label(RichText::new("read-only (from Hermes)").small().color(p.muted));
@@ -541,6 +652,13 @@ fn skills(app: &mut MercuryApp, ui: &mut Ui, p: &theme::Palette) {
             }
         }
     });
+    if let Some((name, on)) = toggled {
+        app.config.disabled_skills.retain(|d| *d != name);
+        if !on {
+            app.config.disabled_skills.push(name);
+        }
+        app.apply_config();
+    }
     if let Some(n) = delete {
         match lib.delete(&n) {
             Ok(()) => {
@@ -618,6 +736,8 @@ fn general(app: &mut MercuryApp, ui: &mut Ui, p: &theme::Palette) {
         .color(p.muted),
     );
     dirty |= ui.checkbox(&mut app.config.ui.show_reasoning, "Expand model reasoning by default").changed();
+    dirty |= ui.checkbox(&mut app.config.ui.resume_last, "Open the last chat when Mercury starts").changed();
+    dirty |= ui.checkbox(&mut app.config.ui.show_speed, "Show reply speed (tokens/s) in the status bar").changed();
 
     section(ui, p, "Agent", "");
     egui::Grid::new("agent_grid").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
@@ -689,7 +809,8 @@ fn hermes(app: &mut MercuryApp, ui: &mut Ui, p: &theme::Palette) {
     let current = app.paths.profile.clone();
     let mut switch = None;
     let mut delete = None;
-    for name in app.profiles.clone() {
+    let mut export = None;
+    for (i, name) in app.profiles.clone().into_iter().enumerate() {
         ui.horizontal(|ui| {
             let label = if name == current { RichText::new(format!("{name}  (open)")).strong() } else { RichText::new(&name) };
             ui.label(label);
@@ -699,6 +820,13 @@ fn hermes(app: &mut MercuryApp, ui: &mut Ui, p: &theme::Palette) {
             }
             if name != current && ui.small_button(format!("Open {name}")).clicked() {
                 switch = Some(name.clone());
+            }
+            if ui
+                .small_button(format!("Export {name}"))
+                .on_hover_text("Save as .tar.gz: chats, memory, skills, SOUL.md and settings. API keys are left out.")
+                .clicked()
+            {
+                export = Some(i);
             }
             if name == current || name == crate::config::DEFAULT_PROFILE {
                 return;
@@ -730,11 +858,19 @@ fn hermes(app: &mut MercuryApp, ui: &mut Ui, p: &theme::Palette) {
             app.create_profile();
         }
     });
+    ui.horizontal(|ui| {
+        if ui.button("Import a profile export…").on_hover_text("A .tar.gz made by Export (here or on another computer)").clicked() {
+            app.browse(super::browse::PickPurpose::ProfileArchive);
+        }
+    });
     if let Some(n) = switch {
         app.switch_profile(&n, false);
     }
     if let Some(n) = delete {
         app.delete_profile(&n);
+    }
+    if let Some(i) = export {
+        app.browse(super::browse::PickPurpose::ExportDir(i));
     }
 
     // ---- Hermes ------------------------------------------------------------------------

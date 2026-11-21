@@ -26,7 +26,7 @@ pub fn from_messages(msgs: &[Message]) -> Vec<ChatItem> {
                 if m.text().starts_with("[Summary of our earlier conversation]") {
                     out.push(ChatItem::Info("Earlier messages were summarised to save context.".into()));
                 }
-                out.push(ChatItem::User(m.text().to_string()));
+                out.push(ChatItem::User(user_label(m.text(), m.images.len())));
             }
             Role::Assistant => {
                 if !m.text().is_empty() || m.reasoning.is_some() {
@@ -60,6 +60,42 @@ pub fn from_messages(msgs: &[Message]) -> Vec<ChatItem> {
         }
     }
     out
+}
+
+/// How a user message reads in the transcript (images are noted, not shown).
+pub fn user_label(text: &str, images: usize) -> String {
+    match images {
+        0 => text.to_string(),
+        1 => format!("{text}\n\n[1 image attached]"),
+        n => format!("{text}\n\n[{n} images attached]"),
+    }
+}
+
+/// The searchable text of an item.
+fn item_text(item: &ChatItem) -> String {
+    match item {
+        ChatItem::User(t) | ChatItem::Notice(t) | ChatItem::Error(t) | ChatItem::Info(t) => t.clone(),
+        ChatItem::Assistant { text, reasoning, .. } => format!("{text}\n{reasoning}"),
+        ChatItem::Tool { summary, args, output, .. } => format!("{summary}\n{args}\n{}", output.as_deref().unwrap_or("")),
+    }
+}
+
+/// Indices of items containing `query` (case-insensitive). Empty query: none.
+pub fn find_matches(items: &[ChatItem], query: &str) -> Vec<usize> {
+    let q = query.trim().to_lowercase();
+    if q.is_empty() {
+        return vec![];
+    }
+    items.iter().enumerate().filter(|(_, it)| item_text(it).to_lowercase().contains(&q)).map(|(i, _)| i).collect()
+}
+
+/// Find-in-chat state for one frame of rendering.
+#[derive(Default)]
+pub struct Highlight<'a> {
+    pub matches: &'a [usize],
+    pub current: Option<usize>,
+    /// Scroll the current match into view (set for one frame after it changes).
+    pub scroll: bool,
 }
 
 /// Append streamed text to the live assistant item, creating it if needed.
@@ -96,9 +132,24 @@ pub fn commit_assistant(items: &mut Vec<ChatItem>, m: &Message) {
     }
 }
 
-pub fn render(ui: &mut Ui, items: &[ChatItem], p: &Palette, cache: &mut CommonMarkCache, show_reasoning: bool) {
+pub fn render(ui: &mut Ui, items: &[ChatItem], p: &Palette, cache: &mut CommonMarkCache, show_reasoning: bool, hl: &Highlight<'_>) {
     let width = ui.available_width();
     for (idx, item) in items.iter().enumerate() {
+        let r = ui.scope(|ui| render_item(ui, idx, item, p, cache, show_reasoning, width)).response;
+        if hl.matches.contains(&idx) {
+            let current = hl.current == Some(idx);
+            let stroke = egui::Stroke::new(if current { 2.5 } else { 1.0 }, if current { p.accent } else { p.warn });
+            ui.painter().rect_stroke(r.rect.expand(3.0), 6.0, stroke, egui::StrokeKind::Outside);
+            if current && hl.scroll {
+                r.scroll_to_me(Some(Align::Center));
+            }
+        }
+        ui.add_space(8.0);
+    }
+}
+
+fn render_item(ui: &mut Ui, idx: usize, item: &ChatItem, p: &Palette, cache: &mut CommonMarkCache, show_reasoning: bool, width: f32) {
+    {
         match item {
             ChatItem::User(t) => {
                 ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
@@ -131,6 +182,12 @@ pub fn render(ui: &mut Ui, items: &[ChatItem], p: &Palette, cache: &mut CommonMa
                         ui.spinner();
                         if text.is_empty() && reasoning.is_empty() {
                             ui.label(RichText::new("Waiting for the model…").color(p.muted).small());
+                        }
+                    });
+                } else if !text.is_empty() {
+                    ui.push_id(("copy", idx), |ui| {
+                        if ui.small_button("Copy").on_hover_text("Copy this reply as Markdown").clicked() {
+                            ui.ctx().copy_text(text.clone());
                         }
                     });
                 }
@@ -182,7 +239,6 @@ pub fn render(ui: &mut Ui, items: &[ChatItem], p: &Palette, cache: &mut CommonMa
                     });
             }
         }
-        ui.add_space(8.0);
     }
 }
 
@@ -203,6 +259,11 @@ mod tests {
         let msgs = vec![Message::user("hi"), a, Message::tool("c1", "terminal", "Error: nope"), Message::assistant("done")];
         let items = from_messages(&msgs);
         assert_eq!(items.len(), 3);
+        assert_eq!(find_matches(&items, "DONE"), vec![2]);
+        assert_eq!(find_matches(&items, "nope"), vec![1], "tool output is searchable");
+        assert!(find_matches(&items, "  ").is_empty());
+        let with_img = from_messages(&[Message::user_with_images("see", vec!["data:x".into(), "data:y".into()])]);
+        assert_eq!(with_img[0], ChatItem::User("see\n\n[2 images attached]".into()));
         assert!(matches!(&items[1], ChatItem::Tool { summary, output: Some(_), is_error: true, .. } if summary == "$ ls"));
     }
 

@@ -15,23 +15,40 @@ pub enum PickPurpose {
     Logo,
     /// The agent's working directory.
     Workdir,
+    /// A file to attach to the next message.
+    Attachment,
+    /// Where to save an export of profile number `n` (index into the profile list).
+    ExportDir(usize),
+    /// A profile export to import.
+    ProfileArchive,
 }
 
 impl PickPurpose {
     pub fn wants_file(self) -> bool {
-        self == PickPurpose::Logo
+        matches!(self, PickPurpose::Logo | PickPurpose::Attachment | PickPurpose::ProfileArchive)
     }
     pub fn title(self) -> &'static str {
         match self {
             PickPurpose::HermesFolder => "Choose your Hermes folder",
             PickPurpose::Logo => "Choose a logo image",
             PickPurpose::Workdir => "Choose the working directory",
+            PickPurpose::Attachment => "Attach a file",
+            PickPurpose::ExportDir(_) => "Choose where to save the export",
+            PickPurpose::ProfileArchive => "Choose a Mercury profile export (.tar.gz)",
         }
     }
     pub fn extensions(self) -> &'static [&'static str] {
         match self {
             PickPurpose::Logo => &["png", "jpg", "jpeg", "webp", "gif", "bmp", "ico"],
+            PickPurpose::ProfileArchive => &["gz", "tgz"],
+            // Attachments: any file; unsupported ones are explained when picked.
             _ => &[],
+        }
+    }
+    fn filter_name(self) -> &'static str {
+        match self {
+            PickPurpose::ProfileArchive => "Profile exports",
+            _ => "Images",
         }
     }
 }
@@ -50,7 +67,7 @@ pub fn system_pick(purpose: PickPurpose, start: &Path) -> Result<Option<PathBuf>
     let t = Instant::now();
     let mut d = rfd::FileDialog::new().set_title(purpose.title()).set_directory(start);
     if !purpose.extensions().is_empty() {
-        d = d.add_filter("Images", purpose.extensions());
+        d = d.add_filter(purpose.filter_name(), purpose.extensions());
     }
     let r = if purpose.wants_file() { d.pick_file() } else { d.pick_folder() };
     match r {
